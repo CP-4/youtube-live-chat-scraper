@@ -2,6 +2,12 @@
 
 This folder is the isolated canonical application surface for YouTube conversation analysis.
 
+Install the app dependencies from this folder:
+
+```bash
+../.venv/bin/python -m pip install -r requirements.txt
+```
+
 Run it from this folder so Streamlit loads the adjacent `.streamlit/config.toml`:
 
 ```bash

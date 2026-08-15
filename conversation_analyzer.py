@@ -163,7 +163,7 @@ def normalize_record(raw: Mapping[str, Any], source_hint: str | None = None,
     timestamp = _text(_lookup(raw, "timestamp_iso", mapping))
     amount = _text(_lookup(raw, "amount", mapping))
     badges = _text(_lookup(raw, "badges", mapping))
-    message_id = _text(_lookup(raw, "message_id", mapping))
+    message_id = _text(_lookup(raw, "message_id", mapping)) or _text(raw.get("record_id"))
     video_id = _text(_lookup(raw, "video_id", mapping))
     video_url = _text(_lookup(raw, "video_url", mapping))
     video_title = _text(_lookup(raw, "video_title", mapping))
@@ -178,7 +178,7 @@ def normalize_record(raw: Mapping[str, Any], source_hint: str | None = None,
     if isinstance(raw_json, (dict, list)):
         raw_json = json.dumps(raw_json, ensure_ascii=False)
     row = {
-        "record_id": message_id,
+        "record_id": f"{source_type}-{message_id}",
         "source_type": source_type,
         "video_id": video_id,
         "video_url": video_url,
@@ -404,6 +404,29 @@ def rows_to_csv(rows: Sequence[Mapping[str, Any]]) -> bytes:
     return handle.getvalue().encode("utf-8")
 
 
+def ensure_record_ids(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Give every row a stable, unique widget/persistence key.
+
+    Older extracted runs did not store ``record_id`` and can contain the same
+    message ID in different sources. The source prefix plus collision suffix
+    keeps those runs renderable without changing their raw message IDs.
+    """
+    result: list[dict[str, Any]] = []
+    seen: Counter[str] = Counter()
+    for index, original in enumerate(rows, start=1):
+        row = dict(original)
+        source = _text(row.get("source_type")) or "import"
+        existing = _text(row.get("record_id"))
+        if not existing or existing == "unknown":
+            basis = "|".join((source, _text(row.get("message_id")), _text(row.get("timestamp_iso")), _text(row.get("author_name")), _text(row.get("message")), str(index)))
+            existing = f"{source}-{hashlib.sha1(basis.encode('utf-8')).hexdigest()[:16]}"
+        occurrence = seen[existing]
+        seen[existing] += 1
+        row["record_id"] = existing if occurrence == 0 else f"{existing}-{occurrence + 1}"
+        result.append(row)
+    return result
+
+
 def rows_to_json(rows: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any] | None = None) -> bytes:
     payload = {"metadata": dict(metadata or {}), "row_count": len(rows), "rows": list(rows)}
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -482,7 +505,7 @@ def make_run(rows: Sequence[Mapping[str, Any]], *, title: str = "Untitled conver
              url: str = "", source_status: Mapping[str, Any] | None = None, warnings: Sequence[str] = (),
              synthetic: bool = False) -> dict[str, Any]:
     run_id = uuid.uuid4().hex[:12]
-    cloned = [dict(row) for row in rows]
+    cloned = ensure_record_ids(rows)
     summary = analysis_summary(cloned)
     return {
         "run_id": run_id,

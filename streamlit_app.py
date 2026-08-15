@@ -16,16 +16,16 @@ import streamlit as st
 try:
     from .conversation_analyzer import (
         CATEGORIES, SOURCE_LABELS, SUBCATEGORIES, RunStore, analysis_summary,
-        audience_summary, category_counts, filter_rows, generate_sample_records,
-        inferred_mapping, make_run, parse_import_bytes, rows_to_csv, rows_to_json,
+        audience_summary, category_counts, ensure_record_ids, filter_rows, generate_sample_records,
+        inferred_mapping, make_run, normalize_records, parse_import_bytes, rows_to_csv, rows_to_json,
         host_review_csv, validate_youtube_url,
     )
     from .scrape_youtube_live_chat import VIDEO_URL, extract_combined
 except ImportError:  # Streamlit executes this file as a top-level script.
     from conversation_analyzer import (
         CATEGORIES, SOURCE_LABELS, SUBCATEGORIES, RunStore, analysis_summary,
-        audience_summary, category_counts, filter_rows, generate_sample_records,
-        inferred_mapping, make_run, parse_import_bytes, rows_to_csv, rows_to_json,
+        audience_summary, category_counts, ensure_record_ids, filter_rows, generate_sample_records,
+        inferred_mapping, make_run, normalize_records, parse_import_bytes, rows_to_csv, rows_to_json,
         host_review_csv, validate_youtube_url,
     )
     from scrape_youtube_live_chat import VIDEO_URL, extract_combined
@@ -128,6 +128,7 @@ def ai_generate(prompt: str) -> str:
 
 
 def save_run(run: dict[str, Any]) -> None:
+    run["rows"] = ensure_record_ids(run.get("rows", []))
     run["summary"] = analysis_summary(run.get("rows", []))
     run["row_count"] = len(run.get("rows", []))
     run["run_id"] = STORE.save(run)
@@ -196,11 +197,13 @@ def run_extraction(video_url: str, include_chat: bool, include_comments: bool, m
     os.close(buffer_fd)
     buffer_path = Path(buffer_name)
     try:
-        rows, issues = extract_combined(
+        raw_rows, issues = extract_combined(
             video_url.strip(), buffer_path,
             include_chat=include_chat, include_comments=include_comments,
             max_comments=max_comments or None, progress_callback=progress,
         )
+        rows, normalization_warnings = normalize_records(raw_rows)
+        issues.extend(normalization_warnings)
     finally:
         buffer_path.unlink(missing_ok=True)
     chat_count = sum(row.get("source_type") == "chat" for row in rows)
@@ -342,7 +345,7 @@ def render_overview(run: dict[str, Any]) -> None:
 
 
 def render_message_item(run: dict[str, Any], row: dict[str, Any], prefix: str = "row") -> None:
-    rid = row.get("record_id", "unknown")
+    rid = row.get("record_id") or row.get("message_id") or "unknown"
     with st.container(border=True):
         top = st.columns([1.1, 5.5, 1.4])
         with top[0]:
