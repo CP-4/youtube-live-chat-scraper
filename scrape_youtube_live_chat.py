@@ -18,6 +18,8 @@ from yt_dlp import YoutubeDL
 
 
 VIDEO_URL = "https://www.youtube.com/watch?v=vhEJQ3l8G_E"
+MAX_COMMENTS = 5000
+MAX_CHAT_PAGES = 5000
 CSV_FIELDS = [
     "source_type", "video_id", "video_url", "video_title", "channel_name", "duration_seconds",
     "message_type", "message_id", "video_offset_ms", "timestamp_usec",
@@ -25,6 +27,18 @@ CSV_FIELDS = [
     "badges", "amount", "currency", "membership_months", "raw_json",
     "comment_like_count", "comment_parent_id", "comment_author_is_uploader",
 ]
+
+
+class YtDlpExtractionError(RuntimeError):
+    """yt-dlp could not expose the requested public source."""
+
+
+class InnerTubeExtractionError(RuntimeError):
+    """The public page/InnerTube replay fallback failed."""
+
+
+class CommentsExtractionError(RuntimeError):
+    """The comments source failed independently of chat replay."""
 
 
 def runs_text(value):
@@ -189,30 +203,47 @@ def extract(video_url, output=None, progress_callback: Optional[Callable[[int, i
         if output:
             write_rows(rows, output)
         return rows
-    except Exception as exc:
+    except Exception as ytdlp_exc:
         if progress_callback:
             progress_callback(0, 0)
-        print(f"yt-dlp live-chat extraction failed; using InnerTube fallback: {exc}")
+        ytdlp_error = YtDlpExtractionError(str(ytdlp_exc))
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"})
-    page_response = session.get(video_url, timeout=45)
-    page_response.raise_for_status()
+    try:
+        page_response = session.get(video_url, timeout=45)
+        page_response.raise_for_status()
+    except requests.RequestException as exc:
+        raise InnerTubeExtractionError(f"yt-dlp failed ({ytdlp_error}); YouTube page request failed: {exc}") from exc
     page = page_response.text
     api_key = first(r'"INNERTUBE_API_KEY":"([^"]+)', page)
     client_version = first(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)', page)
     continuation = first(r'"liveChatRenderer":\{"continuations":\[\{"reloadContinuationData":\{"continuation":"([^"]+)', page)
     if not all((api_key, client_version, continuation)):
-        raise RuntimeError("Could not find YouTube live-chat replay continuation")
+        raise InnerTubeExtractionError(f"yt-dlp failed ({ytdlp_error}); could not find a public live-chat replay continuation")
     metadata = page_metadata(page, video_id, video_url)
     endpoint = "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat_replay?key=" + api_key
     rows, seen = [], set()
     page_count = 0
     while continuation:
         page_count += 1
-        response = session.post(endpoint, json={"context": {"client": {
-            "clientName": "WEB", "clientVersion": client_version}},
-            "continuation": continuation}, timeout=45)
-        response.raise_for_status()
+        if page_count > MAX_CHAT_PAGES:
+            raise InnerTubeExtractionError(f"Stopped after {MAX_CHAT_PAGES:,} replay pages as a safety limit")
+        payload = {"context": {"client": {"clientName": "WEB", "clientVersion": client_version}}, "continuation": continuation}
+        response = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = session.post(endpoint, json=payload, timeout=45)
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                last_error = exc
+                if response is not None and response.status_code not in {408, 425, 429, 500, 502, 503, 504}:
+                    break
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+        if response is None or last_error and not response.ok:
+            raise InnerTubeExtractionError(f"yt-dlp failed ({ytdlp_error}); replay page {page_count} failed after retries: {last_error}") from last_error
         data = response.json().get("continuationContents", {}).get("liveChatContinuation", {})
         for action in data.get("actions", []):
             replay = action.get("replayChatItemAction", {})
@@ -238,7 +269,7 @@ def extract(video_url, output=None, progress_callback: Optional[Callable[[int, i
             progress_callback(page_count, len(rows))
         else:
             print(f"pages={page_count:,} records={len(rows):,}", end="\r", flush=True)
-        time.sleep(0.05)
+        time.sleep(1.0)
     rows.sort(key=lambda row: (int(row["video_offset_ms"] or 0), row["timestamp_usec"], row["message_id"]))
     if output:
         write_rows(rows, output)
@@ -253,6 +284,8 @@ def extract_comments(video_url, progress_callback=None, max_comments=None):
     match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", video_url)
     if not match:
         raise ValueError("Enter a valid YouTube video URL with an 11-character video ID.")
+    if max_comments is not None and max_comments > MAX_COMMENTS:
+        raise ValueError(f"Max comments cannot exceed {MAX_COMMENTS:,}.")
 
     options = {
         "getcomments": True,
@@ -264,8 +297,11 @@ def extract_comments(video_url, progress_callback=None, max_comments=None):
     }
     if max_comments:
         options["extractor_args"]["youtube"]["max_comments"] = [str(max_comments)]
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(video_url, download=False)
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+    except Exception as exc:
+        raise CommentsExtractionError(f"yt-dlp comments request failed: {exc}") from exc
 
     video_id = info.get("id", match.group(1))
     resolved_url = info.get("webpage_url") or video_url
@@ -289,6 +325,9 @@ def extract_combined(video_url, output, include_chat=True, include_comments=True
     rows = []
     issues = []
 
+    if max_comments is not None and max_comments > MAX_COMMENTS:
+        raise ValueError(f"Max comments cannot exceed {MAX_COMMENTS:,}.")
+
     if include_chat:
         try:
             def chat_progress(page_count, record_count):
@@ -296,7 +335,7 @@ def extract_combined(video_url, output, include_chat=True, include_comments=True
                     progress_callback("chat", page_count, record_count)
             rows.extend(extract(video_url, progress_callback=chat_progress))
         except Exception as exc:
-            issues.append(f"Live chat: {exc}")
+            issues.append(f"Live chat unavailable ({type(exc).__name__}): {exc}")
 
     if include_comments:
         try:
@@ -307,7 +346,7 @@ def extract_combined(video_url, output, include_chat=True, include_comments=True
                 video_url, progress_callback=comment_progress, max_comments=max_comments
             ))
         except Exception as exc:
-            issues.append(f"Comments: {exc}")
+            issues.append(f"Comments unavailable ({type(exc).__name__}): {exc}")
 
     rows.sort(key=lambda row: (row["timestamp_usec"] or "", row["source_type"], row["message_id"]))
     if not rows:
