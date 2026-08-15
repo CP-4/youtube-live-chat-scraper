@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import unicodedata
 import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -86,6 +87,46 @@ def _number(value: Any) -> float:
         return 0.0
 
 
+def _bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _message_features(message: str) -> dict[str, Any]:
+    """Compute cheap, auditable features used by deterministic classification."""
+    text = _text(message)
+    words = re.findall(r"[A-Za-z0-9\u0900-\u097F]+", text, re.UNICODE)
+    shortcode_emojis = re.findall(r":[A-Za-z0-9_+\-]+:", text)
+    unicode_symbols = sum(unicodedata.category(char) in {"So", "Sk"} for char in text)
+    return {
+        "message_length": len(text),
+        "word_count": len(words),
+        "question_mark_count": text.count("?") + text.count("？"),
+        "emoji_count": len(shortcode_emojis) + unicode_symbols,
+        "mention_count": len(re.findall(r"(?<!\w)@[A-Za-z0-9_\-]+", text)),
+        "has_url": bool(re.search(r"(?:https?://|www\.)\S+", text, re.I)),
+    }
+
+
+def _has_any(text: str, terms: Sequence[str]) -> bool:
+    for term in terms:
+        if re.fullmatch(r"[a-z0-9]+", term):
+            if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text):
+                return True
+        elif term in text:
+            return True
+    return False
+
+
 def extract_video_id(url: str) -> str:
     match = re.search(r"(?:v=|youtu\.be/|shorts/|live/)([A-Za-z0-9_-]{11})", _text(url))
     return match.group(1) if match else ""
@@ -129,29 +170,85 @@ def _infer_source(raw: Mapping[str, Any], source_hint: str | None, message_type:
     return "comment"
 
 
-def _category(message: str, source_type: str, is_question: bool) -> tuple[str, str]:
-    text = message.casefold()
+def _is_question(message: str) -> bool:
+    text = re.sub(r"\s+", " ", message.casefold()).strip()
+    if "?" in text or "？" in text:
+        return True
+    if re.search(r"^(how|why|what|when|where|who|which|can|could|will|would|should|is|are|do|does|did)\b", text):
+        return True
+    return _has_any(text, ("please tell", "tell us", "explain", "बताइए", "बताइये", "बताएं", "क्यों", "कैसे", "कितना", "कितनी", "कितने", "किसलिए", "काहे"))
+
+
+def _classify_message(message: str, source_type: str, is_question: bool) -> tuple[str, str, int, str]:
+    text = re.sub(r"\s+", " ", message.casefold()).strip()
+    features = _message_features(message)
+    length = features["message_length"]
+
+    health_terms = ("health", "स्वास्थ्य", "tabiyat", "तबीयत", "vertigo", "fever", "doctor", "दवा", "औषधि", "how are you", "kaise ho", "कैसे हैं")
+    audio_terms = ("audio", "आवाज़", "आवाज", "sound", "mic", "voice", "video", "no voice", "स्पष्ट नहीं")
+    request_terms = ("guest", "invite", "अतिथि", "बुलाइ", "topic", "विषय", "speak on", "discuss", "चर्चा", "explain")
+    political_terms = (
+        "modi", "modiji", "मोदी", "rahul", "gandhi", "राहुल", "congress", "कांग्रेस", "khangress", "bjp", "भाजपा",
+        "trump", "government", "govt", "सरकार", "चुनाव", "election", "politics", "राजनीति", "policy", "नीति",
+        "army chief", "border", "pakistan", "china", "israel", "leftist", "लेफ्टीस्ट", "राष्ट्र", "देश", "bharat", "भारत",
+        "hindu", "hindus", "हिंदू", "freebie", "freebies", "free bees", "economy", "politician", "politicians", "नेता",
+        "pappu", "pinky", "yogi", "योगी", "cm", "minister", "मंत्री", "शासन", "कानून", "व्यवस्था", "योजना", "scheme",
+        "bulldozer", "बुलडोजर", "gehlot", "yadav", "sonia", "azam khan", "bar dancer", "pole dancer", "vote", "वोट",
+        "sarkar", "super pm", "ramgopal", "chattisgarh", "rajya sabha", "rajsabha", "lok sabha", "parliament",
+        "parliamentary", "leader", "mp", "pm", "rss", "nation", "state", "up", "sp", "aap", "kisan bill",
+        "naxal", "missionary", "forest", "cockroach", "hindusthani", "hindustan", "deep state", "security", "fir",
+        "khagde", "opposition", "विपक्ष", "sanatan", "सनातन", "शूद्र", "आरक्षण", "reservation", "vote bank", "court", "कोर्ट",
+        "गहलोत", "यादव", "सोनिया", "नेहरू", "वंश", "नक्सलवाद", "मिशनरी", "राज्यसभा", "लोकसभा", "सांसद",
+    )
+    greeting_terms = ("ram", "ram ram", "राम राम", "namaste", "नमस्ते", "namaskar", "pranam", "प्रणाम", "parnam", "सादर", "जय", "हर हर", "ॐ", "om ", "🙏", ":folded_hands:", "hare krishna", "krishna", "jagannath", "वंदे", "vande")
+    mantra_terms = ("jai shree ram", "जय श्री राम", "जय श्रीराम", "हर हर महादेव", "राम नाम", "जय हिंद", "वंदे मातरम्", "वन्दे मातरम्", "वन्देमातरम", "वन्दे मातरम", "hariye na himmat", "हारिए न हिम्मत", "हिम्मत बिसारिए", "good night", "धन्यवाद", "thank you")
+    celebration_terms = ("congrat", "शुभकामना", "birthday", "जन्मदिन", "welcome", "स्वागत", "community", "समुदाय", "milestone")
+    logistics_terms = ("link", "लिंक", "stream", "live", "moderator", "moderation", "internet", "spam", "स्पैम", "break", "ब्रेक", "speed", "स्पीड", "repeat", "repeater", "no live", "not streamed", "notification", "प्रोग्राम", "program", "cancel", "कैंसल", "स्थगित", "breaking news", "ब्रेकिंग न्यूज")
+    feedback_terms = ("analysis", "great", "excellent", "beautiful", "better", "best", "good", "fan", "praise", "अच्छा", "अच्छी", "सुंदर", "बेहतरीन", "बढ़िया", "घृणित", "घिन", "घटिया", "शरम", "बोरिंग", "recover", "kudos", "low", "loud", "clear")
+
+    # Strong domain signals take precedence over the generic question flag.
+    if _has_any(text, audio_terms):
+        return "Stream logistics", "Audio/video", 95, "audio/video signal"
+    if _has_any(text, health_terms):
+        if _has_any(text, ("great", "excellent", "बेहतरीन", "सुंदर", "beautiful", "fan", "धन्यवाद")):
+            return "Health/feedback", "Praise", 88, "health/praise signal"
+        return "Health/feedback", "Health", 90, "health signal"
+    if _has_any(text, request_terms) and (_has_any(text, ("guest", "invite", "अतिथि", "बुलाइ")) or is_question or length > 35):
+        if _has_any(text, ("guest", "invite", "अतिथि", "बुलाइ")):
+            return "Guest/content requests", "Guest request", 92, "guest request signal"
+        if _has_any(text, ("source", "link", "channel", "स्रोत")):
+            return "Guest/content requests", "Source request", 86, "source request signal"
+        return "Guest/content requests", "Topic request", 82, "topic request signal"
+    if _has_any(text, political_terms):
+        if _has_any(text, ("policy", "नीति", "government", "govt", "सरकार", "army chief", "order", "कानून")):
+            return "Political commentary", "Policy", 84, "policy/politics signal"
+        return "Political commentary", "Domestic politics", 82, "politics signal"
+    if _has_any(text, mantra_terms) and (length > 45 or features["emoji_count"] >= 3):
+        return "Mantras/sign-offs", "Mantra" if not _has_any(text, ("good night", "धन्यवाद", "thank you")) else "Sign-off", 90, "mantra/sign-off signal"
+    if _has_any(text, greeting_terms) and (length <= 180 or is_high_confidence_greeting(message)):
+        return "Greetings/devotional", "Greeting" if _has_any(text, ("ram", "namaste", "नमस्ते", "pranam", "प्रणाम")) else "Prayer/devotional", 90, "greeting/devotional signal"
+    if _has_any(text, feedback_terms):
+        if _has_any(text, ("घृणित", "घिन", "घटिया", "शरम", "बोरिंग", "hate", "bad", "low")):
+            return "Health/feedback", "Critique", 76, "critical feedback signal"
+        return "Health/feedback", "Praise", 76, "positive feedback signal"
+    if _has_any(text, logistics_terms):
+        if _has_any(text, ("link", "लिंक")):
+            return "Stream logistics", "Links/access", 78, "link/access signal"
+        if _has_any(text, ("spam", "स्पैम", "moderator", "moderation")):
+            return "Stream logistics", "Moderation", 78, "moderation signal"
+        return "Stream logistics", "Timing", 72, "stream/timing signal"
     if is_question:
-        if any(word in text for word in ("clarify", "मतलब", "अर्थ", "कैसे", "why", "क्यों")):
-            return "Questions", "Clarification"
-        return "Questions", "Unanswered question"
-    if any(word in text for word in ("guest", "invite", "अतिथि", "बुलाइ", "topic", "विषय", "speak on")):
-        return "Guest/content requests", "Guest request" if any(word in text for word in ("guest", "invite", "अतिथि")) else "Topic request"
-    if any(word in text for word in ("health", "स्वास्थ्य", "audio", "आवाज़", "sound", "mic", "feedback", "great", "excellent", "बेहतरीन")):
-        if any(word in text for word in ("audio", "आवाज़", "sound", "mic")):
-            return "Stream logistics", "Audio/video"
-        return "Health/feedback", "Praise" if any(word in text for word in ("great", "excellent", "बेहतरीन")) else "Feedback"
-    if any(word in text for word in ("ram ram", "namaste", "नमस्ते", "जय", "हर हर", "ॐ", "om ", "प्रणाम", "🙏")):
-        return "Greetings/devotional", "Greeting" if any(word in text for word in ("ram", "namaste", "नमस्ते", "प्रणाम")) else "Prayer/devotional"
-    if any(word in text for word in ("modi", "rahul", "congress", "bjp", "trump", "government", "सरकार", "चुनाव", "election", "politics", "राजनीति")):
-        return "Political commentary", "Domestic politics" if any(word in text for word in ("modi", "rahul", "congress", "bjp", "सरकार", "चुनाव")) else "International politics"
-    if any(word in text for word in ("congrat", "शुभकामना", "birthday", "जन्मदिन", "welcome", "स्वागत", "community", "समुदाय")):
-        return "Celebrations/community", "Celebration" if any(word in text for word in ("congrat", "शुभकामना", "birthday", "जन्मदिन")) else "Community"
-    if any(word in text for word in ("link", "लिंक", "when", "कब", "start", "शुरू", "stream", "live", "moderator", "internet")):
-        return "Stream logistics", "Links/access" if any(word in text for word in ("link", "लिंक")) else "Timing"
-    if any(word in text for word in ("jai shree ram", "हर हर महादेव", "राम नाम", "जय हिंद", "शुभ रात्रि", "good night", "धन्यवाद", "thank you")):
-        return "Mantras/sign-offs", "Mantra" if any(word in text for word in ("jai", "हर हर", "राम नाम", "जय हिंद")) else "Sign-off"
-    return "General", "Comment"
+        if _has_any(text, ("clarify", "मतलब", "अर्थ", "explain", "कैसे", "why", "क्यों")):
+            return "Questions", "Clarification", 86, "question/clarification signal"
+        return "Questions", "Unanswered question", 80, "question signal"
+    if _has_any(text, celebration_terms):
+        return "Celebrations/community", "Celebration" if _has_any(text, ("congrat", "शुभकामना", "birthday", "जन्मदिन")) else "Community", 78, "celebration/community signal"
+    return "General", "Comment", 52 if length > 20 else 45, "no strong domain signal"
+
+
+def _category(message: str, source_type: str, is_question: bool) -> tuple[str, str]:
+    category, subcategory, _, _ = _classify_message(message, source_type, is_question)
+    return category, subcategory
 
 
 def is_high_confidence_greeting(message: str) -> bool:
@@ -196,8 +293,8 @@ def normalize_record(raw: Mapping[str, Any], source_hint: str | None = None,
     video_url = _text(_lookup(raw, "video_url", mapping))
     video_title = _text(_lookup(raw, "video_title", mapping))
     channel_name = _text(_lookup(raw, "channel_name", mapping))
-    is_question = bool(re.search(r"\?|\b(how|why|what|when|where|can|could|will|क्या|क्यों|कैसे|कब|कहाँ|कौन)\b", message, re.I))
-    category, subcategory = _category(message, source_type, is_question)
+    is_question = _is_question(message)
+    category, subcategory, classification_confidence, classification_reason = _classify_message(message, source_type, is_question)
     explicit_category = _text(raw.get("category"))
     ai_excluded = is_high_confidence_greeting(message)
     superchat = bool(amount) or any(token in (message_type + " " + badges).casefold() for token in ("paid", "superchat", "super chat"))
@@ -235,12 +332,20 @@ def normalize_record(raw: Mapping[str, Any], source_hint: str | None = None,
         "subcategory": _text(raw.get("subcategory")) or subcategory,
         "category_source": "imported" if explicit_category in CATEGORIES else "deterministic",
         "ai_excluded": ai_excluded,
-        "is_question": bool(raw.get("is_question", is_question)),
-        "answered": bool(raw.get("answered", False)),
-        "starred": bool(raw.get("starred", False)),
+        "classification_confidence": int(raw.get("classification_confidence") or classification_confidence),
+        "classification_reason": _text(raw.get("classification_reason")) or classification_reason,
+        "message_length": int(raw.get("message_length") or len(message)),
+        "word_count": int(raw.get("word_count") or _message_features(message)["word_count"]),
+        "question_mark_count": int(raw.get("question_mark_count") or _message_features(message)["question_mark_count"]),
+        "emoji_count": int(raw.get("emoji_count") or _message_features(message)["emoji_count"]),
+        "mention_count": int(raw.get("mention_count") or _message_features(message)["mention_count"]),
+        "has_url": _bool(raw.get("has_url"), _message_features(message)["has_url"]),
+        "is_question": _bool(raw.get("is_question"), is_question),
+        "answered": _bool(raw.get("answered"), False),
+        "starred": _bool(raw.get("starred"), False),
         "notes": _text(raw.get("notes")),
         "importance": int(raw.get("importance") or (3 if superchat else 2 if is_question else 1)),
-        "is_superchat": bool(raw.get("is_superchat", superchat)),
+        "is_superchat": _bool(raw.get("is_superchat"), superchat),
     }
     if row["answered"] and row["category"] == "Questions" and not row["subcategory"]:
         row["subcategory"] = "Answered question"
@@ -427,7 +532,9 @@ def rows_to_csv(rows: Sequence[Mapping[str, Any]]) -> bytes:
         "message_id", "video_offset_ms", "timestamp_usec", "timestamp_iso", "author_name", "author_channel_id",
         "message", "badges", "amount", "currency", "membership_months", "comment_like_count",
         "comment_parent_id", "comment_author_is_uploader", "category", "subcategory", "is_question",
-        "answered", "starred", "notes", "importance", "is_superchat", "synthetic", "category_source", "ai_excluded", "raw_json",
+        "answered", "starred", "notes", "importance", "is_superchat", "synthetic", "category_source", "ai_excluded",
+        "classification_confidence", "classification_reason", "message_length", "word_count", "question_mark_count",
+        "emoji_count", "mention_count", "has_url", "raw_json",
     ]
     handle = io.StringIO(newline="")
     writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")

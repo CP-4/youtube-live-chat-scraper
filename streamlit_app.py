@@ -6,6 +6,7 @@ import html
 import json
 import os
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,10 @@ try:
         host_review_csv, validate_youtube_url,
     )
     from .scrape_youtube_live_chat import VIDEO_URL, extract_combined, fetch_video_metadata
+    from .classification_ai import (
+        AI_BATCH_SIZE, AI_MAX_ROWS, DEFAULT_GEMINI_MODEL, ai_categorize_rows as _ai_categorize_rows,
+        ai_generate as _ai_generate, get_ai_key as _env_ai_key, get_ai_model as _env_ai_model,
+    )
 except ImportError:  # Streamlit executes this file as a top-level script.
     from conversation_analyzer import (
         CATEGORIES, SOURCE_LABELS, SUBCATEGORIES, RunStore, analysis_summary,
@@ -29,6 +34,10 @@ except ImportError:  # Streamlit executes this file as a top-level script.
         host_review_csv, validate_youtube_url,
     )
     from scrape_youtube_live_chat import VIDEO_URL, extract_combined, fetch_video_metadata
+    from classification_ai import (
+        AI_BATCH_SIZE, AI_MAX_ROWS, DEFAULT_GEMINI_MODEL, ai_categorize_rows as _ai_categorize_rows,
+        ai_generate as _ai_generate, get_ai_key as _env_ai_key, get_ai_model as _env_ai_model,
+    )
 
 
 st.set_page_config(
@@ -102,9 +111,7 @@ st.markdown(
 
 
 STORE = RunStore()
-AI_BATCH_SIZE = 40
-AI_MAX_ROWS = 500
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = DEFAULT_GEMINI_MODEL
 
 
 def get_ai_key() -> str:
@@ -112,7 +119,7 @@ def get_ai_key() -> str:
         secret = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
         secret = ""
-    return str(secret or os.environ.get("GEMINI_API_KEY", "")).strip()
+    return str(secret or _env_ai_key()).strip()
 
 
 def get_ai_model() -> str:
@@ -120,118 +127,15 @@ def get_ai_model() -> str:
         secret = st.secrets.get("GEMINI_MODEL", "")
     except Exception:
         secret = ""
-    return str(secret or os.environ.get("GEMINI_MODEL", GEMINI_MODEL)).strip() or GEMINI_MODEL
+    return str(secret or _env_ai_model()).strip() or GEMINI_MODEL
 
 
 def ai_generate(prompt: str, json_output: bool = False) -> str:
-    key = get_ai_key()
-    if not key:
-        raise RuntimeError("Gemini is disabled because GEMINI_API_KEY is not configured.")
-    try:
-        from google import genai
-    except ImportError as exc:
-        raise RuntimeError("Gemini support is not installed; install the google-genai dependency.") from exc
-    try:
-        client = genai.Client(api_key=key)
-        request: dict[str, Any] = {
-            "model": get_ai_model(),
-            "input": prompt,
-            "store": False,
-        }
-        if json_output:
-            request["response_format"] = {
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "record_id": {"type": "string"},
-                            "category": {"type": "string"},
-                            "subcategory": {"type": "string"},
-                        },
-                        "required": ["record_id", "category", "subcategory"],
-                    },
-                },
-            }
-        interaction = client.interactions.create(**request)
-        text = str(getattr(interaction, "output_text", "") or "").strip()
-        if text:
-            return text
-        # Keep a small compatibility path for SDK responses that expose only
-        # the structured steps array.
-        for step in reversed(getattr(interaction, "steps", []) or []):
-            for block in reversed(getattr(step, "content", []) or []):
-                text = str(getattr(block, "text", "") or "").strip()
-                if text:
-                    return text
-        raise RuntimeError("Gemini returned no text output.")
-    except Exception as exc:
-        if "404" in str(exc) or "not found" in str(exc).casefold() or "not available" in str(exc).casefold():
-            raise RuntimeError(f"Gemini model {get_ai_model()} is unavailable; set GEMINI_MODEL to a supported model.") from exc
-        raise
+    return _ai_generate(prompt, json_output=json_output, key=get_ai_key(), model=get_ai_model())
 
 
-def _parse_ai_array(response: str) -> list[dict[str, Any]]:
-    """Extract a JSON array from a Gemini response without trusting prose around it."""
-    cleaned = response.strip().replace("```json", "").replace("```", "").strip()
-    start, end = cleaned.find("["), cleaned.rfind("]")
-    if start < 0 or end <= start:
-        raise ValueError("Gemini did not return a JSON array")
-    payload = json.loads(cleaned[start:end + 1])
-    return payload if isinstance(payload, list) else []
-
-
-def ai_categorize_rows(rows: list[dict[str, Any]], limit: int = AI_MAX_ROWS) -> tuple[list[dict[str, Any]], int, str | None]:
-    """Automatically improve deterministic categories with bounded Gemini batches.
-
-    A missing key, missing optional dependency, provider failure, malformed
-    response, or invalid suggestion leaves the deterministic row untouched.
-    Manual corrections are never overwritten.
-    """
-    if not get_ai_key():
-        return rows, 0, None
-    greeting_skipped = sum(1 for row in rows if row.get("ai_excluded"))
-    candidates = [
-        row for row in rows
-        if row.get("message") and not row.get("synthetic")
-        and row.get("category_source") != "manual" and not row.get("ai_excluded")
-    ][:max(0, limit)]
-    if not candidates:
-        if greeting_skipped:
-            return rows, 0, f"Skipped {greeting_skipped:,} high-confidence greetings/wishes before AI classification."
-        return rows, 0, None
-    by_id = {row.get("record_id"): row for row in candidates}
-    applied = 0
-    try:
-        for start in range(0, len(candidates), AI_BATCH_SIZE):
-            batch = candidates[start:start + AI_BATCH_SIZE]
-            compact = [{"record_id": row.get("record_id"), "source": row.get("source_type"), "message": row.get("message")} for row in batch]
-            prompt = (
-                "Classify each public YouTube chat/comment message. Use exactly one category and one subcategory from this schema: "
-                + json.dumps(SUBCATEGORIES, ensure_ascii=False)
-                + ". Return only a JSON array with record_id, category, and subcategory. Preserve the record_id exactly. "
-                "Do not infer facts beyond the message.\n\n"
-                + json.dumps(compact, ensure_ascii=False)
-            )
-            for suggestion in _parse_ai_array(ai_generate(prompt, json_output=True)):
-                row = by_id.get(suggestion.get("record_id"))
-                category = suggestion.get("category")
-                subcategory = suggestion.get("subcategory")
-                if not row or category not in CATEGORIES:
-                    continue
-                allowed_subcategories = SUBCATEGORIES.get(category, [])
-                row["category"] = category
-                row["subcategory"] = subcategory if subcategory in allowed_subcategories else (allowed_subcategories[0] if allowed_subcategories else "Other")
-                row["category_source"] = "ai"
-                row["importance"] = max(int(row.get("importance") or 1), 2 if category == "Questions" else 1)
-                applied += 1
-        warning = f"Skipped {greeting_skipped:,} high-confidence greetings/wishes before AI classification." if greeting_skipped else None
-        return rows, applied, warning
-    except Exception as exc:
-        skipped_note = f" Skipped {greeting_skipped:,} high-confidence greetings/wishes before AI classification." if greeting_skipped else ""
-        return rows, applied, f"AI categorization unavailable after {applied:,} applied suggestion(s): {type(exc).__name__}: {exc}.{skipped_note}"
+def ai_categorize_rows(rows: list[dict[str, Any]], limit: int = AI_MAX_ROWS, progress_callback=None):
+    return _ai_categorize_rows(rows, limit=limit, progress_callback=progress_callback, key=get_ai_key(), model=get_ai_model())
 
 
 def save_run(run: dict[str, Any]) -> None:
@@ -290,17 +194,47 @@ def render_source_banner(run: dict[str, Any]) -> None:
     )
 
 
-def run_extraction(video_url: str, include_chat: bool, include_comments: bool, max_comments: int) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+def run_extraction(video_url: str, include_chat: bool, include_comments: bool, max_comments: int, use_ai: bool = False) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     chat_progress = st.progress(0, text="Live chat · waiting")
     comment_progress = st.progress(0, text="Comments · waiting")
+    classification_progress = st.progress(0, text="Classification · deterministic rules ready")
     status = st.empty()
+    log = st.empty()
+    started = time.monotonic()
+    log_lines = ["Run started · the page is intentionally busy until processing completes."]
+
+    def write_log(message: str) -> None:
+        elapsed = time.monotonic() - started
+        log_lines.append(f"+{elapsed:,.1f}s · {message}")
+        log.code("\n".join(log_lines[-8:]), language="text")
 
     def progress(stage: str, page_count: int, record_count: int) -> None:
         if stage == "chat":
             chat_progress.progress(min(98, max(3, page_count * 3)), text=f"Live chat · {record_count:,} records · page {page_count:,}")
+            write_log(f"Live chat page {page_count:,} · {record_count:,} records")
         elif stage == "comments":
             comment_progress.progress(65, text=f"Comments · {record_count:,} records received")
-        status.info(f"Working on {SOURCE_LABELS.get(stage, stage)}. Partial results remain available if the other source fails.")
+            write_log(f"Comments received · {record_count:,} records")
+        status.info(f"Processing {SOURCE_LABELS.get(stage, stage)}. This page is intentionally locked until the run finishes; partial source results remain available if the other source fails.")
+
+    def ai_progress(event: dict[str, Any]) -> None:
+        processed = int(event.get("processed") or 0)
+        total = max(1, int(event.get("total") or 1))
+        batch = int(event.get("batch") or 0)
+        batches = int(event.get("batches") or 0)
+        applied = int(event.get("applied") or 0)
+        percentage = min(99, max(1, round(processed / total * 100)))
+        if event.get("event") == "request":
+            label = f"AI classification · batch {batch}/{batches} · waiting for response · {applied:,} applied"
+            write_log(f"AI batch {batch}/{batches} request started · {processed:,}/{total:,} candidates · {applied:,} applied")
+        elif event.get("event") == "complete":
+            label = f"AI classification · batch {batch}/{batches} · {processed:,}/{total:,} · {applied:,} applied"
+            write_log(f"AI batch {batch}/{batches} complete · {event.get('batch_applied', 0):,} applied · {applied:,} total")
+        else:
+            label = f"AI classification · preparing {total:,} candidates"
+            write_log(f"AI classification started · {total:,} candidates")
+        classification_progress.progress(percentage, text=label)
+        status.info("AI classification is optional and currently running. The page is intentionally locked; deterministic labels remain the fallback if a request times out.")
 
     buffer_fd, buffer_name = tempfile.mkstemp(prefix="conversation-", suffix=".csv", dir=STORE.root)
     os.close(buffer_fd)
@@ -313,11 +247,17 @@ def run_extraction(video_url: str, include_chat: bool, include_comments: bool, m
         )
         rows, normalization_warnings = normalize_records(raw_rows)
         issues.extend(normalization_warnings)
-        rows, ai_applied, ai_warning = ai_categorize_rows(rows)
-        if ai_applied:
-            issues.append(f"AI categorization applied to {ai_applied:,} records; remaining records retain deterministic categories.")
-        if ai_warning:
-            issues.append(ai_warning)
+        write_log(f"Deterministic classification complete · {len(rows):,} normalized records")
+        classification_progress.progress(100 if not use_ai else 1, text="Classification · deterministic rules complete" if not use_ai else "AI classification · preparing optional enrichment")
+        ai_applied = 0
+        ai_warning = None
+        if use_ai:
+            rows, ai_applied, ai_warning = ai_categorize_rows(rows, progress_callback=ai_progress)
+            if ai_applied:
+                issues.append(f"AI categorization applied to {ai_applied:,} records; remaining records retain deterministic categories.")
+            if ai_warning:
+                issues.append(ai_warning)
+            write_log(f"AI enrichment finished · {ai_applied:,} applied; deterministic labels preserved for the rest")
         metadata = {
             "video_id": next((row.get("video_id") for row in rows if row.get("video_id")), ""),
             "video_url": next((row.get("video_url") for row in rows if row.get("video_url")), video_url),
@@ -335,6 +275,8 @@ def run_extraction(video_url: str, include_chat: bool, include_comments: bool, m
     comment_count = sum(row.get("source_type") == "comment" for row in rows)
     chat_progress.progress(100 if not include_chat or chat_count else 0, text=f"Live chat · {chat_count:,} records")
     comment_progress.progress(100 if not include_comments or comment_count else 0, text=f"Comments · {comment_count:,} records")
+    classification_progress.progress(100, text=f"Classification · {'AI-assisted' if use_ai and ai_applied else 'deterministic'} · complete")
+    write_log(f"Run complete · {len(rows):,} records captured")
     status.success(f"Extraction complete · {len(rows):,} records captured")
     return rows, issues, metadata
 
@@ -348,8 +290,9 @@ def extraction_form(form_key: str, compact: bool = False) -> tuple[bool, dict[st
         with col2:
             include_comments = st.checkbox("Video comments", value=True)
         max_comments = st.number_input("Max comments", min_value=0, max_value=5000, value=1000, step=100, help="0 means the extractor's available comments; the UI caps requests at 5,000.")
+        use_ai = st.checkbox("AI-assisted classification (optional)", value=False, help="Off by default. Deterministic classification always runs. When enabled, Gemini processes at most 1,500 records in default 100-row batches; GEMINI_CLASSIFICATION_BATCH_SIZE can raise this for controlled experiments, with visible progress and a bounded request timeout.")
         submitted = st.form_submit_button("Start extraction", type="primary", use_container_width=True)
-    return submitted, {"url": url, "include_chat": include_chat, "include_comments": include_comments, "max_comments": int(max_comments)}
+    return submitted, {"url": url, "include_chat": include_chat, "include_comments": include_comments, "max_comments": int(max_comments), "use_ai": use_ai}
 
 
 def import_section(key: str, compact: bool = False) -> bool:
@@ -373,13 +316,34 @@ def import_section(key: str, compact: bool = False) -> bool:
             if mapping[canonical] == "(auto)":
                 mapping.pop(canonical)
         st.caption("Detected mapping: " + ", ".join(f"{key} → {value}" for key, value in defaults.items()) if defaults else "No canonical columns detected; choose Message text.")
+    use_ai = st.checkbox("AI-assisted classification (optional)", value=False, key=f"{key}_ai", help="Imports use deterministic classification by default. Enable this only for a bounded Gemini enrichment pass.")
     if st.button("Import and analyze", key=f"{key}_submit", type="primary", use_container_width=True):
         try:
             rows, warnings, _ = parse_import_bytes(payload, upload.name, mapping)
             if not rows:
                 st.error("No usable message rows were found. Map the message column and try again.")
                 return False
-            rows, ai_applied, ai_warning = ai_categorize_rows(rows)
+            ai_applied = 0
+            ai_warning = None
+            if use_ai:
+                ai_progress_bar = st.progress(1, text="AI classification · preparing optional enrichment")
+                ai_status = st.empty()
+                ai_log = st.empty()
+                ai_log_lines = ["Import classification started · deterministic labels are already available."]
+
+                def import_ai_progress(event: dict[str, Any]) -> None:
+                    processed = int(event.get("processed") or 0)
+                    total = max(1, int(event.get("total") or 1))
+                    batch = int(event.get("batch") or 0)
+                    batches = int(event.get("batches") or 0)
+                    applied = int(event.get("applied") or 0)
+                    ai_progress_bar.progress(min(99, max(1, round(processed / total * 100))), text=f"AI classification · batch {batch}/{batches} · {applied:,} applied")
+                    ai_log_lines.append(f"batch {batch}/{batches} · {event.get('event')} · {processed:,}/{total:,} candidates · {applied:,} applied")
+                    ai_log.code("\n".join(ai_log_lines[-8:]), language="text")
+                    ai_status.info("AI enrichment is running; the import page is intentionally busy until it finishes or falls back.")
+
+                rows, ai_applied, ai_warning = ai_categorize_rows(rows, progress_callback=import_ai_progress)
+                ai_progress_bar.progress(100, text=f"AI classification · {ai_applied:,} applied · complete")
             if ai_applied:
                 warnings.append(f"AI categorization applied to {ai_applied:,} records; remaining records retain deterministic categories.")
             if ai_warning:
@@ -412,7 +376,7 @@ def render_landing() -> None:
                 st.error(message)
             else:
                 try:
-                    rows, issues, metadata = run_extraction(values["url"], values["include_chat"], values["include_comments"], values["max_comments"])
+                    rows, issues, metadata = run_extraction(values["url"], values["include_chat"], values["include_comments"], values["max_comments"], values["use_ai"])
                     if rows:
                         status = {
                             "chat": {"status": "complete" if any(row.get("source_type") == "chat" for row in rows) else "failed", "count": sum(row.get("source_type") == "chat" for row in rows)},
@@ -490,6 +454,12 @@ def render_message_item(run: dict[str, Any], row: dict[str, Any], prefix: str = 
             st.markdown(f'<div class="message-text">{html.escape(row.get("message", ""))}</div>', unsafe_allow_html=True)
             if flags:
                 st.caption(" · ".join(flags) + (f" · {row.get('amount')}" if row.get("amount") else ""))
+            st.caption(
+                f"Classifier: {html.escape(row.get('category_source', 'deterministic'))} · "
+                f"confidence {int(row.get('classification_confidence') or 0)} · "
+                f"{html.escape(row.get('classification_reason', ''))} · "
+                f"{int(row.get('message_length') or 0)} chars · {int(row.get('word_count') or 0)} words"
+            )
         with top[2]:
             if st.button("Unstar" if row.get("starred") else "Star", key=f"{prefix}_star_{rid}", use_container_width=True):
                 update_row(run, rid, starred=not row.get("starred"))
@@ -639,7 +609,7 @@ def render_audience(run: dict[str, Any]) -> None:
 
 def render_ai(run: dict[str, Any]) -> None:
     st.markdown("## AI Assistant")
-    st.caption(f"Gemini categorization uses {get_ai_model()} for new live/imported runs when configured, in batches of {AI_BATCH_SIZE} and up to {AI_MAX_ROWS:,} non-synthetic records. Manual corrections are protected.")
+    st.caption(f"Gemini categorization uses {get_ai_model()} only when explicitly enabled, in batches of {AI_BATCH_SIZE} and up to {AI_MAX_ROWS:,} non-synthetic records. Manual corrections are protected; deterministic labels are the default.")
     if not get_ai_key():
         st.info("AI is disabled. Add GEMINI_API_KEY through Streamlit secrets or the environment to enable bounded briefs and categorization; all non-AI analysis remains available.")
         return
@@ -654,8 +624,25 @@ def render_ai(run: dict[str, Any]) -> None:
         except Exception as exc:
             st.error(f"AI request failed: {exc}")
     if st.button(f"Re-run AI categorization for up to {AI_MAX_ROWS:,} records"):
+        ai_progress_bar = st.progress(1, text="AI classification · preparing optional enrichment")
+        ai_status = st.empty()
+        ai_log = st.empty()
+        ai_log_lines = ["AI re-run started · the page is intentionally busy until it finishes or falls back."]
+
+        def rerun_ai_progress(event: dict[str, Any]) -> None:
+            processed = int(event.get("processed") or 0)
+            total = max(1, int(event.get("total") or 1))
+            batch = int(event.get("batch") or 0)
+            batches = int(event.get("batches") or 0)
+            applied = int(event.get("applied") or 0)
+            ai_progress_bar.progress(min(99, max(1, round(processed / total * 100))), text=f"AI classification · batch {batch}/{batches} · {applied:,} applied")
+            ai_log_lines.append(f"batch {batch}/{batches} · {event.get('event')} · {processed:,}/{total:,} candidates · {applied:,} applied")
+            ai_log.code("\n".join(ai_log_lines[-8:]), language="text")
+            ai_status.info("AI enrichment is running; this page is intentionally busy until it finishes or falls back to deterministic labels.")
+
         try:
-            rows, changed, warning = ai_categorize_rows(rows)
+            rows, changed, warning = ai_categorize_rows(rows, progress_callback=rerun_ai_progress)
+            ai_progress_bar.progress(100, text=f"AI classification · {changed:,} applied · complete")
             if warning:
                 st.warning(warning)
             if changed:

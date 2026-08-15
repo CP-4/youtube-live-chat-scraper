@@ -18,6 +18,7 @@ from streamlit_app.conversation_analyzer import (
     rows_to_csv,
     rows_to_json,
 )
+from streamlit_app.classification_ai import ai_categorize_rows
 from streamlit_app.scrape_youtube_live_chat import comment_to_row, renderer_to_row, runs_text
 
 
@@ -111,6 +112,26 @@ class ConversationAnalyzerTests(unittest.TestCase):
         keys = [row["record_id"] for row in run["rows"]]
         self.assertEqual(len(keys), len(set(keys)))
         self.assertTrue(all(key != "unknown" for key in keys))
+
+    def test_deterministic_classifier_records_auditable_message_signals(self):
+        logistics = normalize_record({"source_type": "comment", "message": "Why were your videos not streamed? No notifications too."})
+        politics = normalize_record({"source_type": "chat", "message": "Freebies will destroy the economy; politicians need to stop."})
+        greeting = normalize_record({"source_type": "chat", "message": "Deveshji.sadar.parnam :folded_hands:"})
+        self.assertEqual(logistics["category"], "Stream logistics")
+        self.assertTrue(logistics["is_question"])
+        self.assertGreaterEqual(logistics["message_length"], 50)
+        self.assertGreater(logistics["word_count"], 5)
+        self.assertEqual(politics["category"], "Political commentary")
+        self.assertEqual(greeting["category"], "Greetings/devotional")
+        self.assertEqual(greeting["category_source"], "deterministic")
+
+    def test_ai_is_optional_and_falls_back_without_a_key(self):
+        rows = [normalize_record({"source_type": "comment", "message": "Please discuss this topic."})]
+        before = rows[0]["category"]
+        rows, applied, warning = ai_categorize_rows(rows, key="")
+        self.assertEqual(applied, 0)
+        self.assertEqual(rows[0]["category"], before)
+        self.assertIn("deterministic", warning)
 
 
 if __name__ == "__main__":
