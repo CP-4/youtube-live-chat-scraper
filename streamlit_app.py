@@ -1,10 +1,11 @@
 """Streamlit interface for downloading an auditable YouTube live-chat CSV."""
 
 from pathlib import Path
+from collections import Counter
 
 import streamlit as st
 
-from scrape_youtube_live_chat import VIDEO_URL, extract
+from scrape_youtube_live_chat import VIDEO_URL, extract_combined
 
 
 st.set_page_config(
@@ -32,6 +33,11 @@ st.markdown(
         border-radius: 8px !important;
     }
     [data-testid="stSidebar"] input:focus { border-color: var(--accent) !important; box-shadow: 0 0 0 1px var(--accent) !important; }
+    [data-testid="stSidebar"] [data-testid="stNumberInput"] button {
+        background: #fff !important;
+        color: var(--ink) !important;
+        border-color: #cfc3b5 !important;
+    }
     h1 { letter-spacing: -0.04em; font-size: clamp(2.2rem, 5vw, 4.2rem); line-height: .98; }
     h2, h3 { letter-spacing: -0.025em; }
     .lede { color: var(--muted); font-size: 1.1rem; max-width: 45rem; line-height: 1.55; }
@@ -44,24 +50,31 @@ st.markdown(
 )
 
 
-def run_extraction(video_url: str, output_name: str):
+def run_extraction(video_url: str, output_name: str, include_chat: bool,
+                   include_comments: bool, max_comments: int):
     progress = st.progress(0, text="Opening YouTube page…")
     status = st.empty()
 
-    def update(page_count: int, record_count: int):
-        # The replay API does not expose a total page count, so use an indeterminate
-        # progress bar and make the durable count the primary signal.
-        progress.progress(0, text=f"Reading replay pages · {record_count:,} records captured")
+    def update(stage: str, page_count: int, record_count: int):
+        label = "Reading live-chat replay" if stage == "chat" else "Retrieving video comments"
+        detail = f"Page {page_count:,}" if stage == "chat" else "yt-dlp response received"
+        progress.progress(0, text=f"{label} · {record_count:,} records captured")
         status.markdown(
             f'<div class="status-strip"><div class="status-label">Live extraction</div>'
-            f'<strong>Page {page_count:,}</strong> · {record_count:,} records captured</div>',
+            f'<strong>{detail}</strong> · {record_count:,} records captured</div>',
             unsafe_allow_html=True,
         )
 
-    rows = extract(video_url.strip(), Path(output_name), progress_callback=update)
+    rows, issues = extract_combined(
+        video_url.strip(), Path(output_name),
+        include_chat=include_chat,
+        include_comments=include_comments,
+        max_comments=max_comments or None,
+        progress_callback=update,
+    )
     progress.progress(100, text=f"Complete · {len(rows):,} records")
     status.success(f"Wrote {len(rows):,} records to `{output_name}`.")
-    return rows
+    return rows, issues
 
 
 def normalize_output_name(output_name: str) -> str:
@@ -73,9 +86,9 @@ def normalize_output_name(output_name: str) -> str:
     return output_name if output_name.lower().endswith(".csv") else f"{output_name}.csv"
 
 
-st.title("YouTube live-chat extractor")
+st.title("YouTube conversation extractor")
 st.markdown(
-    '<p class="lede">Capture a live-chat replay into a flat, auditable CSV — with message metadata, timestamps, badges, purchases, and the original renderer JSON preserved.</p>',
+    '<p class="lede">Bring post-video comments and live-chat replay into one auditable CSV. Every row is labelled <code>comment</code> or <code>chat</code>, with source-specific metadata preserved.</p>',
     unsafe_allow_html=True,
 )
 
@@ -84,16 +97,25 @@ with st.sidebar:
     st.caption("The replay must be publicly accessible and have live-chat replay available.")
     with st.form("capture_form"):
         video_url = st.text_input("YouTube video URL", value=VIDEO_URL)
-        output_name = st.text_input("Output filename", value="livechat.csv")
-        submitted = st.form_submit_button("Extract live chat", type="primary", use_container_width=True)
+        output_name = st.text_input("Output filename", value="youtube_conversation.csv")
+        include_comments = st.checkbox("Include video comments", value=True)
+        max_comments = st.number_input("Max comments (0 = all)", min_value=0, value=0, step=100)
+        include_chat = st.checkbox("Include live-chat replay", value=True)
+        submitted = st.form_submit_button("Extract conversation", type="primary", use_container_width=True)
     st.divider()
-    st.caption("Output keeps the original 18-column schema from the command-line extractor.")
+    st.caption("The combined CSV adds source_type plus comment likes, parent IDs, and uploader flags.")
 
 if submitted:
     try:
         output_name = normalize_output_name(output_name)
+        if not include_comments and not include_chat:
+            raise ValueError("Select at least one source to extract.")
         st.session_state.pop("rows", None)
-        st.session_state["rows"] = run_extraction(video_url, output_name)
+        rows, issues = run_extraction(
+            video_url, output_name, include_chat, include_comments, max_comments
+        )
+        st.session_state["rows"] = rows
+        st.session_state["issues"] = issues
         st.session_state["output_name"] = output_name
     except Exception as exc:
         st.error(f"Extraction failed: {exc}")
@@ -101,8 +123,14 @@ if submitted:
 rows = st.session_state.get("rows")
 if rows is not None:
     output_name = st.session_state["output_name"]
+    counts = Counter(row["source_type"] for row in rows)
     st.subheader("Captured records")
-    st.write(f"{len(rows):,} records · sorted by video offset")
+    st.write(
+        f"{len(rows):,} records · {counts.get('comment', 0):,} comments · "
+        f"{counts.get('chat', 0):,} chat messages"
+    )
+    for issue in st.session_state.get("issues", []):
+        st.warning(f"Partial extraction: {issue}")
     st.dataframe(rows[:200], use_container_width=True, hide_index=True)
     csv_path = Path(output_name)
     if csv_path.exists():
@@ -114,4 +142,4 @@ if rows is not None:
             type="primary",
         )
 else:
-    st.info("Choose a video in the sidebar, then start an extraction to preview and download the CSV.")
+    st.info("Choose one or both sources in the sidebar, then start an extraction to preview and download the combined CSV.")
