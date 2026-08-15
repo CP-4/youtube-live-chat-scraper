@@ -20,12 +20,24 @@ st.markdown(
     :root { --ink: #17212b; --muted: #5d6b78; --accent: #d95f39; --wash: #f4efe8; }
     .stApp { background: #fbfaf8; color: var(--ink); }
     [data-testid="stSidebar"] { background: var(--wash); border-right: 1px solid #e2d9ce; }
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: var(--ink) !important; }
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color: var(--ink) !important; font-weight: 650; }
+    [data-testid="stSidebar"] input {
+        background: #fff !important;
+        color: var(--ink) !important;
+        border: 1px solid #cfc3b5 !important;
+        border-radius: 8px !important;
+    }
+    [data-testid="stSidebar"] input:focus { border-color: var(--accent) !important; box-shadow: 0 0 0 1px var(--accent) !important; }
     h1 { letter-spacing: -0.04em; font-size: clamp(2.2rem, 5vw, 4.2rem); line-height: .98; }
     h2, h3 { letter-spacing: -0.025em; }
     .lede { color: var(--muted); font-size: 1.1rem; max-width: 45rem; line-height: 1.55; }
     .status-strip { border: 1px solid #e2d9ce; background: #fff; padding: 1rem 1.15rem; border-radius: 12px; }
     .status-label { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; }
-    div.stButton > button[kind="primary"] { background: var(--accent); border-color: var(--accent); }
+    div.stButton > button[kind="primary"] { background: var(--accent); border-color: var(--accent); color: #fff; }
     </style>
     """,
     unsafe_allow_html=True,
