@@ -31,7 +31,7 @@ The app is used from a desktop or laptop browser during editorial review. Extrac
 - Validate YouTube video URLs and select live chat replay, comments, or both.
 - Show separate source progress, partial results, actionable errors, source/status metadata, and safe extraction limits.
 - Normalize extracted rows and imported CSV, JSON, or JSONL into one analysis pipeline.
-- Provide Overview, Questions, Conversation, Audience, AI Assistant, Exports, and Past Runs workspaces.
+- Provide Overview, Conversation, Audience, AI Assistant, Exports, and Past Runs workspaces; Questions and Unanswered Questions are review views inside Conversation so the same record is not split across redundant tabs.
 - Persist per-item star, answered, notes, and category/subcategory corrections outside Streamlit session state.
 - UI pagination is allowed, but exports must include every normalized row.
 - AI is optional, bounded, and disabled without a Gemini key; non-AI analysis remains complete.

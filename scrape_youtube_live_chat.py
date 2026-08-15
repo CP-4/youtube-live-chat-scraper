@@ -41,6 +41,19 @@ class CommentsExtractionError(RuntimeError):
     """The comments source failed independently of chat replay."""
 
 
+def fetch_video_metadata(video_url: str) -> dict:
+    """Fetch title/channel metadata without downloading media."""
+    with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+    return {
+        "video_id": info.get("id", ""),
+        "video_url": info.get("webpage_url") or video_url,
+        "video_title": info.get("title", ""),
+        "channel_name": info.get("channel") or info.get("uploader", ""),
+        "duration_seconds": info.get("duration", ""),
+    }
+
+
 def runs_text(value):
     if not isinstance(value, dict):
         return ""

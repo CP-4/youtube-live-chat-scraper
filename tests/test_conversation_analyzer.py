@@ -11,7 +11,9 @@ from streamlit_app.conversation_analyzer import (
     analysis_summary,
     filter_rows,
     generate_sample_records,
+    is_high_confidence_greeting,
     make_run,
+    normalize_record,
     parse_import_bytes,
     rows_to_csv,
     rows_to_json,
@@ -74,6 +76,14 @@ class ConversationAnalyzerTests(unittest.TestCase):
         self.assertEqual(rows[0]["author_name"], "Editor")
         filtered = filter_rows(rows, source="chat")
         self.assertEqual(len(filtered), 1)
+
+    def test_greetings_are_marked_safe_to_exclude_from_ai_only(self):
+        greeting = normalize_record({"message": "राम राम अनुपम जी, स्वतंत्रता दिवस की कोटि कोटि शुभकामनाएं", "source_type": "chat"})
+        question = normalize_record({"message": "राम राम, क्या आप इस विषय पर चर्चा कर सकते हैं?", "source_type": "chat"})
+        self.assertTrue(is_high_confidence_greeting(greeting["message"]))
+        self.assertTrue(greeting["ai_excluded"])
+        self.assertFalse(question["ai_excluded"])
+        self.assertIn(greeting["category"], {"Greetings/devotional", "Celebrations/community"})
 
     def test_persistence_roundtrip_and_full_export_count(self):
         with tempfile.TemporaryDirectory() as directory:

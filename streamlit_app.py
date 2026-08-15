@@ -20,7 +20,7 @@ try:
         inferred_mapping, make_run, normalize_records, parse_import_bytes, rows_to_csv, rows_to_json,
         host_review_csv, validate_youtube_url,
     )
-    from .scrape_youtube_live_chat import VIDEO_URL, extract_combined
+    from .scrape_youtube_live_chat import VIDEO_URL, extract_combined, fetch_video_metadata
 except ImportError:  # Streamlit executes this file as a top-level script.
     from conversation_analyzer import (
         CATEGORIES, SOURCE_LABELS, SUBCATEGORIES, RunStore, analysis_summary,
@@ -28,7 +28,7 @@ except ImportError:  # Streamlit executes this file as a top-level script.
         inferred_mapping, make_run, normalize_records, parse_import_bytes, rows_to_csv, rows_to_json,
         host_review_csv, validate_youtube_url,
     )
-    from scrape_youtube_live_chat import VIDEO_URL, extract_combined
+    from scrape_youtube_live_chat import VIDEO_URL, extract_combined, fetch_video_metadata
 
 
 st.set_page_config(
@@ -103,6 +103,8 @@ st.markdown(
 
 
 STORE = RunStore()
+AI_BATCH_SIZE = 40
+AI_MAX_ROWS = 500
 
 
 def get_ai_key() -> str:
@@ -127,6 +129,67 @@ def ai_generate(prompt: str) -> str:
     return str(getattr(response, "text", "") or "").strip()
 
 
+def _parse_ai_array(response: str) -> list[dict[str, Any]]:
+    """Extract a JSON array from a Gemini response without trusting prose around it."""
+    cleaned = response.strip().replace("```json", "").replace("```", "").strip()
+    start, end = cleaned.find("["), cleaned.rfind("]")
+    if start < 0 or end <= start:
+        raise ValueError("Gemini did not return a JSON array")
+    payload = json.loads(cleaned[start:end + 1])
+    return payload if isinstance(payload, list) else []
+
+
+def ai_categorize_rows(rows: list[dict[str, Any]], limit: int = AI_MAX_ROWS) -> tuple[list[dict[str, Any]], int, str | None]:
+    """Automatically improve deterministic categories with bounded Gemini batches.
+
+    A missing key, missing optional dependency, provider failure, malformed
+    response, or invalid suggestion leaves the deterministic row untouched.
+    Manual corrections are never overwritten.
+    """
+    if not get_ai_key():
+        return rows, 0, None
+    greeting_skipped = sum(1 for row in rows if row.get("ai_excluded"))
+    candidates = [
+        row for row in rows
+        if row.get("message") and not row.get("synthetic")
+        and row.get("category_source") != "manual" and not row.get("ai_excluded")
+    ][:max(0, limit)]
+    if not candidates:
+        if greeting_skipped:
+            return rows, 0, f"Skipped {greeting_skipped:,} high-confidence greetings/wishes before AI classification."
+        return rows, 0, None
+    by_id = {row.get("record_id"): row for row in candidates}
+    applied = 0
+    try:
+        for start in range(0, len(candidates), AI_BATCH_SIZE):
+            batch = candidates[start:start + AI_BATCH_SIZE]
+            compact = [{"record_id": row.get("record_id"), "source": row.get("source_type"), "message": row.get("message")} for row in batch]
+            prompt = (
+                "Classify each public YouTube chat/comment message. Use exactly one category and one subcategory from this schema: "
+                + json.dumps(SUBCATEGORIES, ensure_ascii=False)
+                + ". Return only a JSON array with record_id, category, and subcategory. Preserve the record_id exactly. "
+                "Do not infer facts beyond the message.\n\n"
+                + json.dumps(compact, ensure_ascii=False)
+            )
+            for suggestion in _parse_ai_array(ai_generate(prompt)):
+                row = by_id.get(suggestion.get("record_id"))
+                category = suggestion.get("category")
+                subcategory = suggestion.get("subcategory")
+                if not row or category not in CATEGORIES:
+                    continue
+                allowed_subcategories = SUBCATEGORIES.get(category, [])
+                row["category"] = category
+                row["subcategory"] = subcategory if subcategory in allowed_subcategories else (allowed_subcategories[0] if allowed_subcategories else "Other")
+                row["category_source"] = "ai"
+                row["importance"] = max(int(row.get("importance") or 1), 2 if category == "Questions" else 1)
+                applied += 1
+        warning = f"Skipped {greeting_skipped:,} high-confidence greetings/wishes before AI classification." if greeting_skipped else None
+        return rows, applied, warning
+    except Exception as exc:
+        skipped_note = f" Skipped {greeting_skipped:,} high-confidence greetings/wishes before AI classification." if greeting_skipped else ""
+        return rows, applied, f"AI categorization unavailable after {applied:,} applied suggestion(s): {type(exc).__name__}: {exc}.{skipped_note}"
+
+
 def save_run(run: dict[str, Any]) -> None:
     run["rows"] = ensure_record_ids(run.get("rows", []))
     run["summary"] = analysis_summary(run.get("rows", []))
@@ -145,6 +208,8 @@ def load_current_run() -> dict[str, Any] | None:
 def update_row(run: dict[str, Any], record_id: str, **changes: Any) -> None:
     for row in run.get("rows", []):
         if row.get("record_id") == record_id:
+            if "category" in changes and changes["category"] != row.get("category"):
+                changes["category_source"] = "manual"
             row.update(changes)
             if row.get("category") == "Questions":
                 row["subcategory"] = "Answered question" if row.get("answered") else (row.get("subcategory") or "Unanswered question")
@@ -181,7 +246,7 @@ def render_source_banner(run: dict[str, Any]) -> None:
     )
 
 
-def run_extraction(video_url: str, include_chat: bool, include_comments: bool, max_comments: int) -> tuple[list[dict[str, Any]], list[str]]:
+def run_extraction(video_url: str, include_chat: bool, include_comments: bool, max_comments: int) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     chat_progress = st.progress(0, text="Live chat · waiting")
     comment_progress = st.progress(0, text="Comments · waiting")
     status = st.empty()
@@ -204,6 +269,22 @@ def run_extraction(video_url: str, include_chat: bool, include_comments: bool, m
         )
         rows, normalization_warnings = normalize_records(raw_rows)
         issues.extend(normalization_warnings)
+        rows, ai_applied, ai_warning = ai_categorize_rows(rows)
+        if ai_applied:
+            issues.append(f"AI categorization applied to {ai_applied:,} records; remaining records retain deterministic categories.")
+        if ai_warning:
+            issues.append(ai_warning)
+        metadata = {
+            "video_id": next((row.get("video_id") for row in rows if row.get("video_id")), ""),
+            "video_url": next((row.get("video_url") for row in rows if row.get("video_url")), video_url),
+            "video_title": next((row.get("video_title") for row in rows if row.get("video_title")), ""),
+            "channel_name": next((row.get("channel_name") for row in rows if row.get("channel_name")), ""),
+        }
+        if not metadata["video_title"]:
+            try:
+                metadata.update(fetch_video_metadata(video_url))
+            except Exception as exc:
+                issues.append(f"Video title unavailable ({type(exc).__name__}); the run uses a fallback name.")
     finally:
         buffer_path.unlink(missing_ok=True)
     chat_count = sum(row.get("source_type") == "chat" for row in rows)
@@ -211,7 +292,7 @@ def run_extraction(video_url: str, include_chat: bool, include_comments: bool, m
     chat_progress.progress(100 if not include_chat or chat_count else 0, text=f"Live chat · {chat_count:,} records")
     comment_progress.progress(100 if not include_comments or comment_count else 0, text=f"Comments · {comment_count:,} records")
     status.success(f"Extraction complete · {len(rows):,} records captured")
-    return rows, issues
+    return rows, issues, metadata
 
 
 def extraction_form(form_key: str, compact: bool = False) -> tuple[bool, dict[str, Any]]:
@@ -254,6 +335,11 @@ def import_section(key: str, compact: bool = False) -> bool:
             if not rows:
                 st.error("No usable message rows were found. Map the message column and try again.")
                 return False
+            rows, ai_applied, ai_warning = ai_categorize_rows(rows)
+            if ai_applied:
+                warnings.append(f"AI categorization applied to {ai_applied:,} records; remaining records retain deterministic categories.")
+            if ai_warning:
+                warnings.append(ai_warning)
             first = rows[0]
             run = make_run(rows, title=first.get("video_title") or f"Imported · {upload.name}", channel=first.get("channel_name", ""), url=first.get("video_url", ""), warnings=warnings, synthetic=all(row.get("synthetic") for row in rows))
             run["source_status"] = {"import": {"status": "complete", "count": len(rows), "filename": upload.name}}
@@ -282,14 +368,13 @@ def render_landing() -> None:
                 st.error(message)
             else:
                 try:
-                    rows, issues = run_extraction(values["url"], values["include_chat"], values["include_comments"], values["max_comments"])
+                    rows, issues, metadata = run_extraction(values["url"], values["include_chat"], values["include_comments"], values["max_comments"])
                     if rows:
-                        first = rows[0]
                         status = {
                             "chat": {"status": "complete" if any(row.get("source_type") == "chat" for row in rows) else "failed", "count": sum(row.get("source_type") == "chat" for row in rows)},
                             "comment": {"status": "complete" if any(row.get("source_type") == "comment" for row in rows) else "failed", "count": sum(row.get("source_type") == "comment" for row in rows)},
                         }
-                        run = make_run(rows, title=first.get("video_title", "YouTube conversation"), channel=first.get("channel_name", ""), url=values["url"], source_status=status, warnings=issues)
+                        run = make_run(rows, title=metadata.get("video_title") or "YouTube conversation", channel=metadata.get("channel_name", ""), url=metadata.get("video_url") or values["url"], source_status=status, warnings=issues)
                         save_run(run)
                         st.rerun()
                 except Exception as exc:
@@ -366,7 +451,7 @@ def render_message_item(run: dict[str, Any], row: dict[str, Any], prefix: str = 
                 update_row(run, rid, starred=not row.get("starred"))
             if row.get("is_question") and st.button("Mark unanswered" if row.get("answered") else "Mark answered", key=f"{prefix}_answered_{rid}", use_container_width=True):
                 update_row(run, rid, answered=not row.get("answered"))
-        with st.expander("Edit category, notes, and raw metadata"):
+        with st.expander("Edit category and notes"):
             with st.form(f"{prefix}_edit_{rid}"):
                 category = st.selectbox("Category", CATEGORIES, index=CATEGORIES.index(row.get("category")) if row.get("category") in CATEGORIES else len(CATEGORIES) - 1)
                 sub_options = SUBCATEGORIES.get(category, ["Other"])
@@ -376,13 +461,8 @@ def render_message_item(run: dict[str, Any], row: dict[str, Any], prefix: str = 
                 submitted = st.form_submit_button("Save review state", type="primary")
                 if submitted:
                     update_row(run, rid, category=category, subcategory=subcategory, answered=answered, notes=notes)
-            st.caption("Copy message")
+            st.caption("Copy message text")
             st.code(row.get("message", ""), language=None)
-            raw = row.get("raw_json", "")
-            try:
-                st.json(json.loads(raw) if isinstance(raw, str) else raw)
-            except (ValueError, TypeError):
-                st.code(str(raw), language="json")
 
 
 def render_paged_messages(run: dict[str, Any], rows: list[dict[str, Any]], prefix: str, page_size: int = 20) -> None:
@@ -391,8 +471,37 @@ def render_paged_messages(run: dict[str, Any], rows: list[dict[str, Any]], prefi
         return
     page_count = max(1, (len(rows) + page_size - 1) // page_size)
     page_key = f"{prefix}_page"
-    page = st.number_input(f"Page (1–{page_count})", min_value=1, max_value=page_count, value=min(int(st.session_state.get(page_key, 1)), page_count), step=1, key=page_key)
-    start = (int(page) - 1) * page_size
+    select_key = f"{prefix}_page_select"
+    current = min(max(int(st.session_state.get(page_key, 1)), 1), page_count)
+    nav_prev, nav_select, nav_next = st.columns([1, 2, 1])
+    with nav_prev:
+        previous_clicked = st.button("← Previous", key=f"{prefix}_previous", disabled=current <= 1, use_container_width=True)
+    with nav_next:
+        next_clicked = st.button("Next →", key=f"{prefix}_next", disabled=current >= page_count, use_container_width=True)
+    # Buttons are evaluated before the selectbox is instantiated, so the
+    # selectbox key can be synchronized safely before Streamlit registers it.
+    requested_page = current - 1 if previous_clicked else current + 1 if next_clicked else None
+    if requested_page is not None:
+        st.session_state[page_key] = requested_page
+        st.session_state[select_key] = requested_page
+    with nav_select:
+        select_kwargs = {
+            "options": list(range(1, page_count + 1)),
+            "format_func": lambda value: f"Page {value} of {page_count}",
+            "key": select_key,
+            "label_visibility": "collapsed",
+        }
+        if select_key not in st.session_state:
+            select_kwargs["index"] = current - 1
+        selected = st.selectbox("Page", **select_kwargs)
+    if requested_page is not None:
+        page = requested_page
+    elif selected != current:
+        st.session_state[page_key] = int(selected)
+        page = int(selected)
+    else:
+        page = current
+    start = (page - 1) * page_size
     st.caption(f"Showing {start + 1:,}–{min(start + page_size, len(rows)):,} of {len(rows):,}. Exports are not limited by this page.")
     for row in rows[start:start + page_size]:
         render_message_item(run, row, prefix=prefix)
@@ -410,12 +519,13 @@ def render_questions(run: dict[str, Any]) -> None:
 
 def conversation_filters(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     st.markdown("## Conversation")
-    st.caption("Search the full normalized record set. Page size is intentionally compact; the export tab always uses every row.")
+    st.caption("Search the full record set. Questions and unanswered questions are review queues inside Conversation; exports always use every row.")
     with st.form("conversation_filters"):
-        c1, c2, c3 = st.columns([2.2, 1, 1])
-        search = c1.text_input("Search message, author, or notes", value=st.session_state.get("filter_search", ""))
-        source = c2.selectbox("Source", ["All sources", "chat", "comment", "import"], format_func=lambda value: "All sources" if value == "All sources" else SOURCE_LABELS.get(value, value.title()))
-        category = c3.selectbox("Category", ["All categories", *CATEGORIES])
+        c1, c2, c3 = st.columns([1.45, 2.2, 1])
+        view = c1.selectbox("Review view", ["All conversation", "Questions to host", "Unanswered questions"])
+        search = c2.text_input("Search message, author, or notes", value=st.session_state.get("filter_search", ""))
+        source = c3.selectbox("Source", ["All sources", "chat", "comment", "import"], format_func=lambda value: "All sources" if value == "All sources" else SOURCE_LABELS.get(value, value.title()))
+        category = c1.selectbox("Category", ["All categories", *CATEGORIES])
         c4, c5, c6, c7 = st.columns([1.5, 1.2, 1.2, 1.2])
         subcategory = c4.selectbox("Subcategory", ["All subcategories", *sorted({row.get("subcategory") for row in rows if row.get("subcategory")})])
         author = c5.selectbox("Author", ["All authors", *sorted({row.get("author_name") for row in rows if row.get("author_name")})])
@@ -427,13 +537,18 @@ def conversation_filters(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         submitted = st.form_submit_button("Apply filters", type="primary")
     if submitted:
         st.session_state["filter_search"] = search
-        st.session_state["conversation_filter_values"] = {"search": search, "source": source, "category": category, "subcategory": subcategory, "author": author, "sort": sort, "starred": st_starred, "unanswered": unanswered, "superchat": superchat}
-    values = st.session_state.get("conversation_filter_values", {"search": "", "source": "All sources", "category": "All categories", "subcategory": "All subcategories", "author": "All authors", "sort": "Chronological", "starred": False, "unanswered": False, "superchat": False})
+        st.session_state["conversation_filter_values"] = {"view": view, "search": search, "source": source, "category": category, "subcategory": subcategory, "author": author, "sort": sort, "starred": st_starred, "unanswered": unanswered, "superchat": superchat}
+    values = st.session_state.get("conversation_filter_values", {"view": "All conversation", "search": "", "source": "All sources", "category": "All categories", "subcategory": "All subcategories", "author": "All authors", "sort": "Chronological", "starred": False, "unanswered": False, "superchat": False})
     if st.button("Reset conversation filters", key="reset_filters"):
         st.session_state.pop("conversation_filter_values", None)
         st.session_state.pop("filter_search", None)
         st.rerun()
-    filtered = filter_rows(rows, **values)
+    filter_values = {key: value for key, value in values.items() if key != "view"}
+    filtered = filter_rows(rows, **filter_values)
+    if values.get("view") == "Questions to host":
+        filtered = [row for row in filtered if row.get("is_question")]
+    elif values.get("view") == "Unanswered questions":
+        filtered = [row for row in filtered if row.get("is_question") and not row.get("answered")]
     st.markdown(f"### {len(filtered):,} matching record(s)")
     return filtered
 
@@ -457,7 +572,7 @@ def render_audience(run: dict[str, Any]) -> None:
 
 def render_ai(run: dict[str, Any]) -> None:
     st.markdown("## AI Assistant")
-    st.caption("Optional Gemini assistance is bounded to sampled public messages. It never replaces source labels, raw metadata, or manual review.")
+    st.caption(f"Gemini categorization is automatic for new live/imported runs when configured, using batches of {AI_BATCH_SIZE} and up to {AI_MAX_ROWS:,} non-synthetic records. Manual corrections are protected.")
     if not get_ai_key():
         st.info("AI is disabled. Add GEMINI_API_KEY through Streamlit secrets or the environment to enable bounded briefs and categorization; all non-AI analysis remains available.")
         return
@@ -471,26 +586,17 @@ def render_ai(run: dict[str, Any]) -> None:
             st.markdown(ai_generate(prompt))
         except Exception as exc:
             st.error(f"AI request failed: {exc}")
-    if st.button("Suggest categories for up to 80 records"):
-        prompt = "Classify each message into exactly one of these categories: " + ", ".join(CATEGORIES) + ". Return only a JSON array of objects with record_id, category, subcategory. Do not rewrite messages or invent context.\n\n" + json.dumps(compact, ensure_ascii=False)
+    if st.button(f"Re-run AI categorization for up to {AI_MAX_ROWS:,} records"):
         try:
-            response = ai_generate(prompt).strip().removeprefix("```json").removesuffix("```").strip()
-            suggestions = json.loads(response)
-            by_id = {row.get("record_id"): row for row in rows}
-            changed = 0
-            for suggestion in suggestions if isinstance(suggestions, list) else []:
-                row = by_id.get(suggestion.get("record_id"))
-                if row and suggestion.get("category") in CATEGORIES:
-                    row["category"] = suggestion["category"]
-                    row["subcategory"] = suggestion.get("subcategory") or row.get("subcategory")
-                    row["importance"] = max(int(row.get("importance") or 1), 2)
-                    changed += 1
+            rows, changed, warning = ai_categorize_rows(rows)
+            if warning:
+                st.warning(warning)
             if changed:
                 save_run(run)
-                st.success(f"Applied {changed} bounded AI suggestions. Review or correct them in Conversation.")
+                st.success(f"Applied {changed:,} AI category suggestions. Manual corrections were preserved.")
                 st.rerun()
             else:
-                st.warning("The model returned no usable category suggestions.")
+                st.warning("The model returned no usable category suggestions, or all records were already manually corrected.")
         except Exception as exc:
             st.error(f"AI categorization failed: {exc}")
 
@@ -500,7 +606,11 @@ def render_exports(run: dict[str, Any]) -> None:
     st.caption("Every download here is generated from the persisted full run. Conversation pagination never truncates exports.")
     rows = run.get("rows", [])
     values = st.session_state.get("conversation_filter_values", {})
-    filtered = filter_rows(rows, **values) if values else list(rows)
+    filtered = filter_rows(rows, **{key: value for key, value in values.items() if key != "view"}) if values else list(rows)
+    if values.get("view") == "Questions to host":
+        filtered = [row for row in filtered if row.get("is_question")]
+    elif values.get("view") == "Unanswered questions":
+        filtered = [row for row in filtered if row.get("is_question") and not row.get("answered")]
     summary = analysis_summary(rows)
     st.markdown(f"**Full run:** {len(rows):,} rows · **Current filter:** {len(filtered):,} rows · **Host review:** {sum(row.get('is_question') or row.get('starred') or row.get('is_superchat') for row in rows):,} priority rows")
     c1, c2 = st.columns(2)
@@ -572,16 +682,25 @@ def render_workspace(run: dict[str, Any]) -> None:
         st.session_state["current_run_id"] = None
         st.rerun()
     render_source_banner(run)
-    tabs = st.tabs(["Overview", "Questions", "Conversation", "Audience", "AI Assistant", "Exports", "Past Runs"])
+    rows = run.get("rows", [])
+    summary = analysis_summary(rows)
+    ai_count = sum(row.get("category_source") == "ai" for row in rows)
+    tabs = st.tabs([
+        f"Overview ({summary['total']:,})",
+        f"Conversation ({summary['total']:,})",
+        f"Audience ({summary['unique_authors']:,})",
+        f"AI Assistant ({ai_count:,})",
+        "Exports (4)",
+        f"Past Runs ({len(STORE.list_runs()):,})",
+    ])
     with tabs[0]: render_overview(run)
-    with tabs[1]: render_questions(run)
-    with tabs[2]:
+    with tabs[1]:
         filtered = conversation_filters(run.get("rows", []))
         render_paged_messages(run, filtered, "conversation")
-    with tabs[3]: render_audience(run)
-    with tabs[4]: render_ai(run)
-    with tabs[5]: render_exports(run)
-    with tabs[6]: render_past_runs()
+    with tabs[2]: render_audience(run)
+    with tabs[3]: render_ai(run)
+    with tabs[4]: render_exports(run)
+    with tabs[5]: render_past_runs()
 
 
 run = load_current_run()

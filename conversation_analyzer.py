@@ -154,6 +154,34 @@ def _category(message: str, source_type: str, is_question: bool) -> tuple[str, s
     return "General", "Comment"
 
 
+def is_high_confidence_greeting(message: str) -> bool:
+    """Identify short greetings, blessings, thanks, and wishes safe to skip for AI.
+
+    These rows remain in the run and deterministic analysis; this only prevents
+    predictable low-information messages from consuming AI classification calls.
+    """
+    text = re.sub(r"\s+", " ", _text(message).casefold()).strip()
+    if not text or "?" in text or len(text) > 180:
+        return False
+    greeting_phrases = (
+        "ram ram", "राम राम", "namaste", "नमस्ते", "pranam", "प्रणाम",
+        "jai shree ram", "jai shreeram", "जय श्री राम", "जय श्रीराम", "jai hind", "जय हिंद", "हर हर महादेव",
+        "good morning", "good evening", "good night", "happy birthday",
+        "congratulations", "congrats", "शुभकामन", "बधाई", "स्वागत",
+        "thank you", "thanks", "धन्यवाद", "वंदे मातरम्", "वन्दे मातरम्",
+    )
+    if not any(phrase in text for phrase in greeting_phrases):
+        return False
+    # A greeting followed by a substantive request/topic should still reach AI.
+    substantive_markers = (
+        "audio", "video", "mic", "link", "topic", "guest", "explain", "discuss",
+        "क्यों", "कैसे", "क्या", "विषय", "अतिथि", "चर्चा", "समझा",
+    )
+    if any(marker in text for marker in substantive_markers):
+        return False
+    return len(text.split()) <= 18
+
+
 def normalize_record(raw: Mapping[str, Any], source_hint: str | None = None,
                      synthetic: bool = False, mapping: Mapping[str, str] | None = None) -> dict[str, Any]:
     message = _text(_lookup(raw, "message", mapping))
@@ -170,6 +198,8 @@ def normalize_record(raw: Mapping[str, Any], source_hint: str | None = None,
     channel_name = _text(_lookup(raw, "channel_name", mapping))
     is_question = bool(re.search(r"\?|\b(how|why|what|when|where|can|could|will|क्या|क्यों|कैसे|कब|कहाँ|कौन)\b", message, re.I))
     category, subcategory = _category(message, source_type, is_question)
+    explicit_category = _text(raw.get("category"))
+    ai_excluded = is_high_confidence_greeting(message)
     superchat = bool(amount) or any(token in (message_type + " " + badges).casefold() for token in ("paid", "superchat", "super chat"))
     if not message_id:
         stable = "|".join((source_type, video_id, timestamp, author, message))
@@ -201,8 +231,10 @@ def normalize_record(raw: Mapping[str, Any], source_hint: str | None = None,
         "comment_parent_id": _text(raw.get("comment_parent_id") or raw.get("parent")),
         "comment_author_is_uploader": _text(raw.get("comment_author_is_uploader") or raw.get("author_is_uploader")),
         "synthetic": bool(synthetic or raw.get("synthetic")),
-        "category": _text(raw.get("category")) if _text(raw.get("category")) in CATEGORIES else category,
+        "category": explicit_category if explicit_category in CATEGORIES else category,
         "subcategory": _text(raw.get("subcategory")) or subcategory,
+        "category_source": "imported" if explicit_category in CATEGORIES else "deterministic",
+        "ai_excluded": ai_excluded,
         "is_question": bool(raw.get("is_question", is_question)),
         "answered": bool(raw.get("answered", False)),
         "starred": bool(raw.get("starred", False)),
@@ -395,7 +427,7 @@ def rows_to_csv(rows: Sequence[Mapping[str, Any]]) -> bytes:
         "message_id", "video_offset_ms", "timestamp_usec", "timestamp_iso", "author_name", "author_channel_id",
         "message", "badges", "amount", "currency", "membership_months", "comment_like_count",
         "comment_parent_id", "comment_author_is_uploader", "category", "subcategory", "is_question",
-        "answered", "starred", "notes", "importance", "is_superchat", "synthetic", "raw_json",
+        "answered", "starred", "notes", "importance", "is_superchat", "synthetic", "category_source", "ai_excluded", "raw_json",
     ]
     handle = io.StringIO(newline="")
     writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")

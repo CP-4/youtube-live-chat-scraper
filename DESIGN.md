@@ -24,12 +24,12 @@ A host or editor reviews a live conversation at a desk in daylight or a moderate
 
 ## Composition
 
-The first viewport is status-first: source banner, counts, category distribution, source coverage, and host attention. The workbench uses seven stable tabs: Overview, Questions, Conversation, Audience, AI Assistant, Exports, and Past Runs. Raw metadata is progressive disclosure inside each review item; raw CSV is never the opening surface.
+The first viewport is status-first: source banner, counts, category distribution, source coverage, and host attention. The workbench uses six stable tabs: Overview, Conversation, Audience, AI Assistant, Exports, and Past Runs. Questions and Unanswered Questions are review views inside Conversation. Raw metadata is retained in exports but is not shown in the everyday review UI; raw CSV is never the opening surface.
 
 ## Components
 
 - Status banner: title, channel, linked URL, source chips/counts, synthetic warning, saved timestamp, and run ID.
-- Evidence item: source/time, author, category/subcategory, message, flags, star/answer actions, editable review state, copyable text, and raw JSON.
+- Evidence item: source/time, author, category/subcategory, message, flags, star/answer actions, editable review state, and copyable text.
 - Queue: bounded pagination with explicit “showing x–y of n”; all exports use the full persisted run.
 - Source chip: blue live-chat, umber comments, neutral imported data.
 - Empty state: three direct paths—new extraction, synthetic sample, and import/recover.
