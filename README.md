@@ -8,6 +8,9 @@ Install the app dependencies from this folder:
 ../.venv/bin/python -m pip install -r requirements.txt
 ```
 
+Use Python 3.10 or newer for this environment. The Gemini Interactions API
+support in `google-genai` 2.x is not installable on Python 3.9.
+
 Run it from this folder so Streamlit loads the adjacent `.streamlit/config.toml`:
 
 ```bash

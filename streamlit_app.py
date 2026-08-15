@@ -123,7 +123,7 @@ def get_ai_model() -> str:
     return str(secret or os.environ.get("GEMINI_MODEL", GEMINI_MODEL)).strip() or GEMINI_MODEL
 
 
-def ai_generate(prompt: str) -> str:
+def ai_generate(prompt: str, json_output: bool = False) -> str:
     key = get_ai_key()
     if not key:
         raise RuntimeError("Gemini is disabled because GEMINI_API_KEY is not configured.")
@@ -133,11 +133,29 @@ def ai_generate(prompt: str) -> str:
         raise RuntimeError("Gemini support is not installed; install the google-genai dependency.") from exc
     try:
         client = genai.Client(api_key=key)
-        interaction = client.interactions.create(
-            model=get_ai_model(),
-            input=prompt,
-            store=False,
-        )
+        request: dict[str, Any] = {
+            "model": get_ai_model(),
+            "input": prompt,
+            "store": False,
+        }
+        if json_output:
+            request["response_format"] = {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "record_id": {"type": "string"},
+                            "category": {"type": "string"},
+                            "subcategory": {"type": "string"},
+                        },
+                        "required": ["record_id", "category", "subcategory"],
+                    },
+                },
+            }
+        interaction = client.interactions.create(**request)
         text = str(getattr(interaction, "output_text", "") or "").strip()
         if text:
             return text
@@ -197,7 +215,7 @@ def ai_categorize_rows(rows: list[dict[str, Any]], limit: int = AI_MAX_ROWS) -> 
                 "Do not infer facts beyond the message.\n\n"
                 + json.dumps(compact, ensure_ascii=False)
             )
-            for suggestion in _parse_ai_array(ai_generate(prompt)):
+            for suggestion in _parse_ai_array(ai_generate(prompt, json_output=True)):
                 row = by_id.get(suggestion.get("record_id"))
                 category = suggestion.get("category")
                 subcategory = suggestion.get("subcategory")
