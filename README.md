@@ -25,7 +25,9 @@ Gemini Flash in batches of 40 for category/subcategory suggestions. Missing
 keys, provider failures, and malformed responses fall back to deterministic
 classification; manual corrections are never overwritten. Short, high-confidence
 greetings, blessings, thanks, and wishes remain in the run but are excluded from
-the AI payload to save tokens; substantive messages still go to Gemini.
+the AI payload to save tokens; substantive messages still go to Gemini. The app
+uses the `google-genai` Interactions API with `gemini-2.5-flash` by default; set
+`GEMINI_MODEL` through secrets or the environment to override it.
 
 Run the isolated tests from the repository root:
 

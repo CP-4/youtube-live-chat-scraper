@@ -104,6 +104,7 @@ st.markdown(
 STORE = RunStore()
 AI_BATCH_SIZE = 40
 AI_MAX_ROWS = 500
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 def get_ai_key() -> str:
@@ -114,18 +115,44 @@ def get_ai_key() -> str:
     return str(secret or os.environ.get("GEMINI_API_KEY", "")).strip()
 
 
+def get_ai_model() -> str:
+    try:
+        secret = st.secrets.get("GEMINI_MODEL", "")
+    except Exception:
+        secret = ""
+    return str(secret or os.environ.get("GEMINI_MODEL", GEMINI_MODEL)).strip() or GEMINI_MODEL
+
+
 def ai_generate(prompt: str) -> str:
     key = get_ai_key()
     if not key:
         raise RuntimeError("Gemini is disabled because GEMINI_API_KEY is not configured.")
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError as exc:
-        raise RuntimeError("Gemini support is not installed; install the optional AI dependency.") from exc
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(prompt)
-    return str(getattr(response, "text", "") or "").strip()
+        raise RuntimeError("Gemini support is not installed; install the google-genai dependency.") from exc
+    try:
+        client = genai.Client(api_key=key)
+        interaction = client.interactions.create(
+            model=get_ai_model(),
+            input=prompt,
+            store=False,
+        )
+        text = str(getattr(interaction, "output_text", "") or "").strip()
+        if text:
+            return text
+        # Keep a small compatibility path for SDK responses that expose only
+        # the structured steps array.
+        for step in reversed(getattr(interaction, "steps", []) or []):
+            for block in reversed(getattr(step, "content", []) or []):
+                text = str(getattr(block, "text", "") or "").strip()
+                if text:
+                    return text
+        raise RuntimeError("Gemini returned no text output.")
+    except Exception as exc:
+        if "404" in str(exc) or "not found" in str(exc).casefold() or "not available" in str(exc).casefold():
+            raise RuntimeError(f"Gemini model {get_ai_model()} is unavailable; set GEMINI_MODEL to a supported model.") from exc
+        raise
 
 
 def _parse_ai_array(response: str) -> list[dict[str, Any]]:
@@ -464,25 +491,54 @@ def render_message_item(run: dict[str, Any], row: dict[str, Any], prefix: str = 
             st.code(row.get("message", ""), language=None)
 
 
-def render_paged_messages(run: dict[str, Any], rows: list[dict[str, Any]], prefix: str, page_size: int = 20) -> None:
-    if not rows:
-        st.info("No records match this queue. Reset filters or broaden the question criteria.")
-        return
-    page_count = max(1, (len(rows) + page_size - 1) // page_size)
-    page_key = f"{prefix}_page"
-    select_key = f"{prefix}_page_select"
-    current = min(max(int(st.session_state.get(page_key, 1)), 1), page_count)
+def _set_page(page_key: str, select_key: str, page: int) -> None:
+    st.session_state[page_key] = page
+    st.session_state[select_key] = page
+
+
+def render_page_controls(page_count: int, current: int, page_key: str, select_key: str, prefix: str, bottom: bool = False) -> int:
+    if bottom:
+        st.caption(f"Page {current} of {page_count} · End of this page")
+        nav_prev, nav_spacer, nav_next = st.columns([1, 4, 1])
+        with nav_prev:
+            st.button(
+                "← Previous",
+                key=f"{prefix}_bottom_previous",
+                disabled=current <= 1,
+                use_container_width=True,
+                on_click=_set_page,
+                args=(page_key, select_key, current - 1),
+            )
+        with nav_next:
+            st.button(
+                "Next →",
+                key=f"{prefix}_bottom_next",
+                disabled=current >= page_count,
+                use_container_width=True,
+                on_click=_set_page,
+                args=(page_key, select_key, current + 1),
+            )
+        return current
+
     nav_prev, nav_select, nav_next = st.columns([1, 2, 1])
     with nav_prev:
-        previous_clicked = st.button("← Previous", key=f"{prefix}_previous", disabled=current <= 1, use_container_width=True)
+        st.button(
+            "← Previous",
+            key=f"{prefix}_previous",
+            disabled=current <= 1,
+            use_container_width=True,
+            on_click=_set_page,
+            args=(page_key, select_key, current - 1),
+        )
     with nav_next:
-        next_clicked = st.button("Next →", key=f"{prefix}_next", disabled=current >= page_count, use_container_width=True)
-    # Buttons are evaluated before the selectbox is instantiated, so the
-    # selectbox key can be synchronized safely before Streamlit registers it.
-    requested_page = current - 1 if previous_clicked else current + 1 if next_clicked else None
-    if requested_page is not None:
-        st.session_state[page_key] = requested_page
-        st.session_state[select_key] = requested_page
+        st.button(
+            "Next →",
+            key=f"{prefix}_next",
+            disabled=current >= page_count,
+            use_container_width=True,
+            on_click=_set_page,
+            args=(page_key, select_key, current + 1),
+        )
     with nav_select:
         select_kwargs = {
             "options": list(range(1, page_count + 1)),
@@ -493,61 +549,55 @@ def render_paged_messages(run: dict[str, Any], rows: list[dict[str, Any]], prefi
         if select_key not in st.session_state:
             select_kwargs["index"] = current - 1
         selected = st.selectbox("Page", **select_kwargs)
-    if requested_page is not None:
-        page = requested_page
-    elif selected != current:
+    if selected != current:
         st.session_state[page_key] = int(selected)
-        page = int(selected)
-    else:
-        page = current
+        return int(selected)
+    return current
+
+
+def render_paged_messages(run: dict[str, Any], rows: list[dict[str, Any]], prefix: str, page_size: int = 20) -> None:
+    if not rows:
+        st.info("No records match this queue. Reset filters or broaden the question criteria.")
+        return
+    page_count = max(1, (len(rows) + page_size - 1) // page_size)
+    page_key = f"{prefix}_page"
+    select_key = f"{prefix}_page_select"
+    current = min(max(int(st.session_state.get(page_key, 1)), 1), page_count)
+    page = render_page_controls(page_count, current, page_key, select_key, prefix)
     start = (page - 1) * page_size
     st.caption(f"Showing {start + 1:,}–{min(start + page_size, len(rows)):,} of {len(rows):,}. Exports are not limited by this page.")
     for row in rows[start:start + page_size]:
         render_message_item(run, row, prefix=prefix)
-
-
-def render_questions(run: dict[str, Any]) -> None:
-    rows = run.get("rows", [])
-    st.markdown("## Questions")
-    st.caption("A host-ready queue built from question signals, with unanswered items kept visible until reviewed.")
-    unanswered_only = st.checkbox("Show unanswered only", value=True, key="questions_unanswered")
-    question_rows = [row for row in rows if row.get("is_question") and (not unanswered_only or not row.get("answered"))]
-    st.markdown(f"### {len(question_rows):,} question(s) in queue")
-    render_paged_messages(run, sorted(question_rows, key=lambda row: (-int(row.get("importance") or 0), row.get("timestamp_iso") or "")), "questions")
+    st.divider()
+    render_page_controls(page_count, page, page_key, select_key, prefix, bottom=True)
 
 
 def conversation_filters(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     st.markdown("## Conversation")
-    st.caption("Search the full record set. Questions and unanswered questions are review queues inside Conversation; exports always use every row.")
+    st.caption("Use Category = Questions for the host queue, and Unanswered for questions still needing a response. Exports always use every row.")
     with st.form("conversation_filters"):
         c1, c2, c3 = st.columns([1.45, 2.2, 1])
-        view = c1.selectbox("Review view", ["All conversation", "Questions to host", "Unanswered questions"])
+        category = c1.selectbox("Category", ["All categories", *CATEGORIES])
         search = c2.text_input("Search message, author, or notes", value=st.session_state.get("filter_search", ""))
         source = c3.selectbox("Source", ["All sources", "chat", "comment", "import"], format_func=lambda value: "All sources" if value == "All sources" else SOURCE_LABELS.get(value, value.title()))
-        category = c1.selectbox("Category", ["All categories", *CATEGORIES])
         c4, c5, c6, c7 = st.columns([1.5, 1.2, 1.2, 1.2])
-        subcategory = c4.selectbox("Subcategory", ["All subcategories", *sorted({row.get("subcategory") for row in rows if row.get("subcategory")})])
-        author = c5.selectbox("Author", ["All authors", *sorted({row.get("author_name") for row in rows if row.get("author_name")})])
-        sort = c6.selectbox("Sort", ["Chronological", "Importance"])
-        st_starred = c7.checkbox("Starred")
+        author = c4.selectbox("Author", ["All authors", *sorted({row.get("author_name") for row in rows if row.get("author_name")})])
+        sort = c5.selectbox("Sort", ["Chronological", "Importance"])
+        st_starred = c6.checkbox("Starred")
+        unanswered = c7.checkbox("Unanswered")
         c8, c9 = st.columns([1.2, 4])
-        unanswered = c8.checkbox("Unanswered")
-        superchat = c9.checkbox("SuperChat")
+        superchat = c8.checkbox("SuperChat")
         submitted = st.form_submit_button("Apply filters", type="primary")
     if submitted:
         st.session_state["filter_search"] = search
-        st.session_state["conversation_filter_values"] = {"view": view, "search": search, "source": source, "category": category, "subcategory": subcategory, "author": author, "sort": sort, "starred": st_starred, "unanswered": unanswered, "superchat": superchat}
-    values = st.session_state.get("conversation_filter_values", {"view": "All conversation", "search": "", "source": "All sources", "category": "All categories", "subcategory": "All subcategories", "author": "All authors", "sort": "Chronological", "starred": False, "unanswered": False, "superchat": False})
+        st.session_state["conversation_filter_values"] = {"search": search, "source": source, "category": category, "author": author, "sort": sort, "starred": st_starred, "unanswered": unanswered, "superchat": superchat}
+    values = st.session_state.get("conversation_filter_values", {"search": "", "source": "All sources", "category": "All categories", "author": "All authors", "sort": "Chronological", "starred": False, "unanswered": False, "superchat": False})
     if st.button("Reset conversation filters", key="reset_filters"):
         st.session_state.pop("conversation_filter_values", None)
         st.session_state.pop("filter_search", None)
         st.rerun()
-    filter_values = {key: value for key, value in values.items() if key != "view"}
+    filter_values = {key: value for key, value in values.items() if key not in {"view", "subcategory"}}
     filtered = filter_rows(rows, **filter_values)
-    if values.get("view") == "Questions to host":
-        filtered = [row for row in filtered if row.get("is_question")]
-    elif values.get("view") == "Unanswered questions":
-        filtered = [row for row in filtered if row.get("is_question") and not row.get("answered")]
     st.markdown(f"### {len(filtered):,} matching record(s)")
     return filtered
 
@@ -571,7 +621,7 @@ def render_audience(run: dict[str, Any]) -> None:
 
 def render_ai(run: dict[str, Any]) -> None:
     st.markdown("## AI Assistant")
-    st.caption(f"Gemini categorization is automatic for new live/imported runs when configured, using batches of {AI_BATCH_SIZE} and up to {AI_MAX_ROWS:,} non-synthetic records. Manual corrections are protected.")
+    st.caption(f"Gemini categorization uses {get_ai_model()} for new live/imported runs when configured, in batches of {AI_BATCH_SIZE} and up to {AI_MAX_ROWS:,} non-synthetic records. Manual corrections are protected.")
     if not get_ai_key():
         st.info("AI is disabled. Add GEMINI_API_KEY through Streamlit secrets or the environment to enable bounded briefs and categorization; all non-AI analysis remains available.")
         return
@@ -605,11 +655,7 @@ def render_exports(run: dict[str, Any]) -> None:
     st.caption("Every download here is generated from the persisted full run. Conversation pagination never truncates exports.")
     rows = run.get("rows", [])
     values = st.session_state.get("conversation_filter_values", {})
-    filtered = filter_rows(rows, **{key: value for key, value in values.items() if key != "view"}) if values else list(rows)
-    if values.get("view") == "Questions to host":
-        filtered = [row for row in filtered if row.get("is_question")]
-    elif values.get("view") == "Unanswered questions":
-        filtered = [row for row in filtered if row.get("is_question") and not row.get("answered")]
+    filtered = filter_rows(rows, **{key: value for key, value in values.items() if key not in {"view", "subcategory"}}) if values else list(rows)
     summary = analysis_summary(rows)
     st.markdown(f"**Full run:** {len(rows):,} rows · **Current filter:** {len(filtered):,} rows · **Host review:** {sum(row.get('is_question') or row.get('starred') or row.get('is_superchat') for row in rows):,} priority rows")
     c1, c2 = st.columns(2)
