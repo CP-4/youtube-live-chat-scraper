@@ -43,6 +43,12 @@ st.markdown(
     .lede { color: var(--muted); font-size: 1.1rem; max-width: 45rem; line-height: 1.55; }
     .status-strip { border: 1px solid #e2d9ce; background: #fff; padding: 1rem 1.15rem; border-radius: 12px; }
     .status-label { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; }
+    [data-testid="stAlert"] {
+        background: #fff4d6 !important;
+        border: 1px solid #d9a441 !important;
+        color: #5a3a00 !important;
+    }
+    [data-testid="stAlert"] * { color: #5a3a00 !important; }
     div.stButton > button[kind="primary"] { background: var(--accent); border-color: var(--accent); color: #fff; }
     </style>
     """,
