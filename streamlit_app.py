@@ -35,7 +35,7 @@ st.set_page_config(
     page_title="Conversation Ledger",
     page_icon="◌",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # Impeccable direction contract: editorial evidence ledger; source truth before
@@ -58,8 +58,7 @@ st.markdown(
     :root { --paper:#f5f7f8; --panel:#ffffff; --ink:#15212b; --muted:#61707a; --line:#d9e1e5; --accent:#d95d38; --accent-dark:#a94327; --chat:#2d7691; --comment:#8f5b38; --ok:#28785b; --warn:#8b5c17; }
     .stApp { background: var(--paper); color: var(--ink); }
     [data-testid="stHeader"] { background: rgba(245,247,248,.88); }
-    [data-testid="stSidebar"] { background: #e9eef0; border-right: 1px solid var(--line); }
-    [data-testid="stSidebar"] * { color: var(--ink); }
+    [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] { display:none !important; }
     h1,h2,h3 { color: var(--ink); letter-spacing: -0.025em; }
     h1 { font-size: 2.55rem; line-height: 1.02; margin-bottom: .35rem; }
     h2 { font-size: 1.45rem; margin-top: 1.2rem; }
@@ -655,28 +654,6 @@ def render_past_runs() -> None:
                     st.rerun()
 
 
-def render_sidebar(run: dict[str, Any] | None) -> None:
-    with st.sidebar:
-        st.markdown("### Conversation Ledger")
-        st.caption("Canonical Streamlit workbench")
-        big = st.checkbox("Big-text mode", value=bool(st.session_state.get("big_text", False)))
-        st.session_state["big_text"] = big
-        if big:
-            st.markdown('<style>.main .block-container { max-width: 1200px; }</style>', unsafe_allow_html=True)
-        st.divider()
-        if run:
-            if st.button("＋ New extraction", use_container_width=True):
-                st.session_state["current_run_id"] = None
-                st.rerun()
-            st.markdown("**Import into a new run**")
-            if import_section("sidebar_import", compact=True):
-                st.rerun()
-            st.divider()
-        st.markdown("**Operating boundary**")
-        st.caption("Public YouTube data only. yt-dlp first; InnerTube fallback; no IP rotation or evasion. AI is optional and bounded.")
-        st.caption(f"Persisted runs: {len(STORE.list_runs())}")
-
-
 def render_workspace(run: dict[str, Any]) -> None:
     if st.button("＋ New extraction", key="workspace_new_extraction"):
         st.session_state["current_run_id"] = None
@@ -704,7 +681,6 @@ def render_workspace(run: dict[str, Any]) -> None:
 
 
 run = load_current_run()
-render_sidebar(run)
 if run:
     render_workspace(run)
 else:
