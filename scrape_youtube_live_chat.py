@@ -3,8 +3,10 @@
 
 import argparse
 import csv
+import glob
 import html
 import json
+import tempfile
 import re
 import time
 from datetime import datetime, timezone
@@ -124,11 +126,73 @@ def write_rows(rows, output):
         writer.writerows(rows)
 
 
+def extract_with_ytdlp(video_url, progress_callback=None):
+    """Extract an archived live-chat replay through yt-dlp's supported subtitle path."""
+    match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", video_url)
+    if not match:
+        raise ValueError("Enter a valid YouTube video URL with an 11-character video ID.")
+    video_id = match.group(1)
+    with tempfile.TemporaryDirectory(prefix="youtube-live-chat-") as temp_dir:
+        options = {
+            "writesubtitles": True,
+            "subtitleslangs": ["live_chat"],
+            "subtitlesformat": "json3",
+            "skip_download": True,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": str(Path(temp_dir) / "%(id)s.%(ext)s"),
+        }
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+        candidates = glob.glob(str(Path(temp_dir) / f"{video_id}.live_chat.*"))
+        if not candidates:
+            raise RuntimeError("yt-dlp did not expose a live_chat replay for this video")
+        with Path(candidates[0]).open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+        metadata = {
+            "video_id": info.get("id", video_id),
+            "video_url": info.get("webpage_url") or video_url,
+            "video_title": info.get("title", ""),
+            "channel_name": info.get("channel") or info.get("uploader", ""),
+            "duration_seconds": info.get("duration", ""),
+        }
+        rows = []
+        seen = set()
+        for event in payload.get("events", []):
+            replay = event.get("replayChatItemAction", {})
+            offset = replay.get("videoOffsetTimeMsec", "")
+            for action in replay.get("actions", []):
+                item = action.get("addChatItemAction", {}).get("item", {})
+                if not item:
+                    continue
+                renderer = {next(iter(item)): next(iter(item.values()))}
+                row = renderer_to_row(renderer, metadata, offset)
+                key = row["message_id"] or (row["video_offset_ms"], row["message"], row["author_name"])
+                if key not in seen and (row["message"] or row["message_type"] not in {"ViewerEngagementMessage"}):
+                    seen.add(key)
+                    rows.append(row)
+        if not rows:
+            raise RuntimeError("yt-dlp returned an empty live_chat replay")
+        if progress_callback:
+            progress_callback(1, len(rows))
+        return rows
+
+
 def extract(video_url, output=None, progress_callback: Optional[Callable[[int, int], None]] = None):
     match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", video_url)
     if not match:
         raise ValueError("Enter a valid YouTube video URL with an 11-character video ID.")
     video_id = match.group(1)
+    try:
+        rows = extract_with_ytdlp(video_url, progress_callback=progress_callback)
+        if output:
+            write_rows(rows, output)
+        return rows
+    except Exception as exc:
+        if progress_callback:
+            progress_callback(0, 0)
+        print(f"yt-dlp live-chat extraction failed; using InnerTube fallback: {exc}")
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"})
     page_response = session.get(video_url, timeout=45)
